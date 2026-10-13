@@ -49,8 +49,13 @@ you what is being served and how to get yours, instead of a connection error:
   - the other mode is serving: use its models, or ask the admin to switch;
   - the wanted mode is partly up: still loading, with `Retry-After`;
   - nothing is up: switching or restarting, with `Retry-After`.
-- **Passthrough.** Listed path prefixes (e.g. `/mcp`) are forwarded verbatim, headers included, to another
-  server.
+- **MCP gateway.** `/mcp` is one MCP endpoint (Streamable HTTP, JSON responses) in front of any number of
+  stdio MCP servers:
+  - each server is started on first use, kept running, and restarted if it exits;
+  - a caller sees only the tools its key is granted, named `server-tool`. That is Bifrost's naming, so
+    clients written against Bifrost's MCP gateway keep their tool names;
+  - servers get a clean environment: none of the gateway's keys, only what the config passes.
+- **Passthrough.** Listed path prefixes are forwarded verbatim, headers included, to another server.
 - **Timeouts.** Each upstream has a connect timeout, a whole-request timeout, and an idle timeout between
   streamed chunks. A long cold prefill can be given an hour.
 
@@ -62,8 +67,8 @@ nix run github:ewtodd/maitred -- --config config.json    # or: cargo build --rel
 
 The config path can also come from `MAITRED_CONFIG`. Secrets are never in the file: each key and each
 upstream API key names an environment variable. [`examples/config.json`](examples/config.json) is a
-complete example: one GPU box with two modes, an embedding server, a hosted API, three keys and an `/mcp`
-passthrough.
+complete example: one GPU box with two modes, an embedding server, a hosted API, three keys, an MCP server
+and a passthrough.
 
 `GET /health` answers `ok`.
 
@@ -93,6 +98,11 @@ passthrough.
 | `keys[].models` | Model ids it may use; default `["*"]`. |
 | `keys[].rate_limit` | `{requests, per_secs}`. |
 | `keys[].active_hours` | `{start, end, timezone, message}`; hours 0–23, and `end < start` wraps past midnight. |
+| `keys[].mcp` | MCP grants: server name to its tool names (unprefixed), `["*"]` for all. A key without grants gets no `/mcp`. |
+| `mcp.<name>.command`, `.args` | A stdio MCP server; `<name>` is its tools' prefix. |
+| `mcp.<name>.env` | Variables set for it. It also gets `PATH`, `HOME`, `LANG`, `TZ` and the CA-bundle variables, and nothing else. |
+| `mcp.<name>.pass_env` | Variables passed through from the gateway's environment, e.g. an API key the server needs. |
+| `mcp.<name>.timeout_secs` | Longest a tool call may take (default 300). |
 | `passthrough[]` | `{prefix, target, timeout_secs}`; `target` is an origin such as `http://127.0.0.1:4012`, and the path is kept. |
 
 The config is checked at startup. maitred refuses to start on:
@@ -101,6 +111,7 @@ The config is checked at startup. maitred refuses to start on:
 - duplicate model ids;
 - aliases or defaults outside the model's efforts;
 - key model lists naming unknown models;
+- MCP grants naming unknown servers;
 - bad time zones.
 
 ## Errors
@@ -111,7 +122,7 @@ Every error has the OpenAI shape: `{"error": {"message", "type", "code"}}`.
 | --- | --- | --- |
 | 400 | `invalid_json`, `missing_model` | The body isn't JSON or has no `model`. |
 | 401 | `missing_api_key`, `invalid_api_key` | No key, or an unknown one. |
-| 403 | `key_inactive`, `model_not_allowed` | Outside the key's hours (with its message), or a model it may not use (the message lists what it can). |
+| 403 | `key_inactive`, `model_not_allowed`, `mcp_not_allowed` | Outside the key's hours (with its message), a model it may not use (the message lists what it can), or `/mcp` for a key with no MCP grants. |
 | 404 | `model_not_found` | Unknown model (the message lists the configured ones). |
 | 429 | `rate_limit_exceeded` | With `Retry-After`. |
 | 502 | `upstream_error` | The upstream failed mid-request. |

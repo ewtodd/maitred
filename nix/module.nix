@@ -35,8 +35,9 @@ in
       default = { };
       description = ''
         The configuration file, as Nix. See the README for every field (`upstreams`, `models`, `modes`,
-        `keys`, `passthrough`, `switch_hint`). Secrets do not go here: keys and upstream API keys are
-        read from environment variables named in the settings, set through `environmentFiles`.
+        `keys`, `mcp`, `passthrough`, `switch_hint`). Secrets do not go here: keys and upstream API keys
+        are read from environment variables named in the settings, set through `environmentFiles`. MCP
+        servers run as the service's user with HOME and a state directory at /var/lib/maitred.
       '';
     };
 
@@ -63,9 +64,12 @@ in
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
       restartTriggers = [ configFile ];
+      # The MCP servers' home: some cache or store files there (pass e.g. a storage path under it).
+      environment.HOME = "/var/lib/maitred";
       serviceConfig = {
         ExecStart = "${lib.getExe cfg.package} --config ${configFile}";
         EnvironmentFile = cfg.environmentFiles;
+        StateDirectory = "maitred";
         Restart = "always";
         RestartSec = 2;
         DynamicUser = true;
@@ -84,7 +88,8 @@ in
         ];
         RestrictNamespaces = true;
         LockPersonality = true;
-        MemoryDenyWriteExecute = true;
+        # MCP servers on Node (or any JIT) need writable-executable memory.
+        MemoryDenyWriteExecute = (cfg.settings.mcp or { }) == { };
         SystemCallArchitectures = "native";
       };
     };

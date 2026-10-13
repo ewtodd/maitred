@@ -3,6 +3,7 @@
 use crate::auth::{self, Denied, Keys};
 use crate::config::{Config, Model, Passthrough};
 use crate::effort;
+use crate::mcp::Mcp;
 use crate::status::{self, Probes, Unavailable};
 use axum::Json;
 use axum::body::Body;
@@ -20,6 +21,7 @@ pub struct AppState {
     pub config: Config,
     pub keys: Keys,
     pub probes: Probes,
+    pub mcp: Mcp,
     clients: HashMap<String, reqwest::Client>,
     upstream_keys: HashMap<String, String>,
     passthrough_client: reqwest::Client,
@@ -50,6 +52,7 @@ impl AppState {
             .connect_timeout(Duration::from_secs(5))
             .build()
             .map_err(|e| format!("passthrough client: {e}"))?;
+        let mcp = Mcp::new(&config.mcp);
         let probe_keys = upstream_keys
             .iter()
             .map(|(name, key)| (config.upstreams[name].base_url.clone(), key.clone()))
@@ -58,6 +61,7 @@ impl AppState {
             config,
             keys,
             probes: Probes::new(probe_keys),
+            mcp,
             clients,
             upstream_keys,
             passthrough_client,
@@ -77,7 +81,7 @@ fn with_retry_after(mut r: Response, secs: u64) -> Response {
     r
 }
 
-fn denied(d: Denied) -> Response {
+pub fn denied(d: Denied) -> Response {
     match d {
         Denied::Missing => error(
             StatusCode::UNAUTHORIZED,

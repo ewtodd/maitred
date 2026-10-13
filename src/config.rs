@@ -24,10 +24,36 @@ pub struct Config {
     /// Paths forwarded verbatim (headers included) to another server, e.g. `/mcp` to Bifrost.
     #[serde(default)]
     pub passthrough: Vec<Passthrough>,
+    /// stdio MCP servers aggregated at `/mcp`, by name. A tool `t` of server `s` is offered as `s-t`.
+    #[serde(default)]
+    pub mcp: HashMap<String, McpServer>,
 }
 
 fn default_switch_hint() -> String {
     "ask the admin to switch to {mode}".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServer {
+    /// The program, started once and kept running; restarted on the next call after it exits.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment for the server, on top of `PATH`, `HOME`, `LANG`, `TZ` and the CA-bundle variables. Nothing
+    /// else of the gateway's environment (its keys) is passed.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Variables passed through from the gateway's environment, e.g. an API key the server needs.
+    #[serde(default)]
+    pub pass_env: Vec<String>,
+    /// Longest a `tools/call` may take.
+    #[serde(default = "default_tool_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_tool_timeout() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,6 +149,10 @@ pub struct Key {
     pub rate_limit: Option<RateLimit>,
     #[serde(default)]
     pub active_hours: Option<ActiveHours>,
+    /// MCP tools this key may use: server name -> tool names (unprefixed), `["*"]` for all of them. A key
+    /// without grants gets no `/mcp`.
+    #[serde(default)]
+    pub mcp: HashMap<String, Vec<String>>,
 }
 
 fn all_models() -> Vec<String> {
@@ -204,6 +234,11 @@ impl Config {
             for m in &k.models {
                 if m != "*" && !ids.contains(m.as_str()) {
                     return Err(format!("key {}: unknown model {m}", k.name));
+                }
+            }
+            for server in k.mcp.keys() {
+                if !self.mcp.contains_key(server) {
+                    return Err(format!("key {}: unknown MCP server {server}", k.name));
                 }
             }
             if let Some(h) = &k.active_hours {

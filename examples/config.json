@@ -83,7 +83,7 @@
     }
   ],
   "keys": [
-    { "name": "me", "env": "MAITRED_KEY_ME" },
+    { "name": "me", "env": "MAITRED_KEY_ME", "mcp": { "nixos": ["*"] } },
     { "name": "webui", "env": "MAITRED_KEY_WEBUI" },
     {
       "name": "friend",
@@ -98,7 +98,10 @@
       }
     }
   ],
+  "mcp": {
+    "nixos": { "command": "/run/current-system/sw/bin/mcp-nixos" }
+  },
   "passthrough": [
-    { "prefix": "/mcp", "target": "http://127.0.0.1:4012", "timeout_secs": 3600 }
+    { "prefix": "/metrics", "target": "http://127.0.0.1:9090" }
   ]
 }

@@ -139,6 +139,7 @@ mod tests {
             models: vec!["*".into()],
             rate_limit: None,
             active_hours: None,
+            mcp: HashMap::new(),
         }
     }
 
