@@ -50,10 +50,14 @@ impl AppState {
             .connect_timeout(Duration::from_secs(5))
             .build()
             .map_err(|e| format!("passthrough client: {e}"))?;
+        let probe_keys = upstream_keys
+            .iter()
+            .map(|(name, key)| (config.upstreams[name].base_url.clone(), key.clone()))
+            .collect();
         Ok(AppState {
             config,
             keys,
-            probes: Probes::new(),
+            probes: Probes::new(probe_keys),
             clients,
             upstream_keys,
             passthrough_client,

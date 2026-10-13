@@ -10,11 +10,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub struct Probes {
     client: reqwest::Client,
+    /// Upstream API keys by base URL: a hosted API answers a keyless `/models` with 401.
+    keys: HashMap<String, String>,
     cache: Mutex<HashMap<String, (Instant, bool)>>,
 }
 
 impl Probes {
-    pub fn new() -> Probes {
+    pub fn new(keys: HashMap<String, String>) -> Probes {
         let client = reqwest::Client::builder()
             .connect_timeout(PROBE_TIMEOUT)
             .timeout(PROBE_TIMEOUT)
@@ -22,6 +24,7 @@ impl Probes {
             .expect("probe client");
         Probes {
             client,
+            keys,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -34,7 +37,11 @@ impl Probes {
             return *up;
         }
         let url = format!("{}/models", base_url.trim_end_matches('/'));
-        let up = matches!(self.client.get(&url).send().await, Ok(r) if r.status().is_success());
+        let mut req = self.client.get(&url);
+        if let Some(key) = self.keys.get(base_url) {
+            req = req.bearer_auth(key);
+        }
+        let up = matches!(req.send().await, Ok(r) if r.status().is_success());
         self.cache
             .lock()
             .unwrap()
@@ -213,6 +220,28 @@ mod tests {
         );
         assert!(u.message.contains("still loading"));
         assert_eq!(u.retry_after, Some(60));
+    }
+
+    #[tokio::test]
+    async fn the_probe_sends_the_upstream_key() {
+        use axum::http::{HeaderMap, StatusCode};
+        // A hosted API: /models needs the key.
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|h: HeaderMap| async move {
+                match h.get("authorization").and_then(|v| v.to_str().ok()) {
+                    Some("Bearer sk-up") => StatusCode::OK,
+                    _ => StatusCode::UNAUTHORIZED,
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        assert!(!Probes::new(HashMap::new()).is_up(&base).await);
+        let keyed = Probes::new([(base.clone(), "sk-up".to_string())].into());
+        assert!(keyed.is_up(&base).await);
     }
 
     #[test]
