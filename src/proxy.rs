@@ -160,6 +160,11 @@ fn model_entry(config: &Config, m: &Model, up: &HashMap<String, bool>) -> Value 
     if let Some(d) = &m.default_reasoning_effort {
         e["default_reasoning_effort"] = json!(d);
     }
+    if !m.effort_aliases.is_empty() {
+        // Sorted, so the listing is stable.
+        let aliases: std::collections::BTreeMap<_, _> = m.effort_aliases.iter().collect();
+        e["reasoning_effort_aliases"] = json!(aliases);
+    }
     e["status"] = json!(if serving { "serving" } else { "unavailable" });
     if !serving {
         e["status_reason"] = json!(status::explain(config, m, up).message);
@@ -427,7 +432,8 @@ mod tests {
             "upstreams": {"unholy": {"base_url": "http://a/v1"}, "radiance": {"base_url": "http://b/v1"}, "embed": {"base_url": "http://c/v1"}},
             "models": [
                 {"id": "unholy/dsv4-flash", "upstream": "unholy", "upstream_model": "dsv4-flash", "context_length": 524288,
-                 "reasoning_efforts": ["none", "low", "high", "max"], "default_reasoning_effort": "high"},
+                 "reasoning_efforts": ["none", "low", "high", "max"], "default_reasoning_effort": "high",
+                 "effort_aliases": {"medium": "high"}},
                 {"id": "radiance/qwen3.8-27b", "upstream": "radiance", "upstream_model": "qwen3.8-27b"},
                 {"id": "embed/bge-m3", "upstream": "embed", "upstream_model": "bge-m3"}
             ],
@@ -460,6 +466,7 @@ mod tests {
             json!(["none", "low", "high", "max"])
         );
         assert_eq!(e["default_reasoning_effort"], "high");
+        assert_eq!(e["reasoning_effort_aliases"], json!({"medium": "high"}));
         assert_eq!(e["status"], "serving");
         let e = model_entry(&c, &c.models[1], &up);
         assert_eq!(e["status"], "unavailable");

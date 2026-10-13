@@ -4,7 +4,8 @@
 //! answers `high` or `max` with a 400; unholy's DeepSeek takes none/low/high/max). A request's level is kept
 //! when the model takes it, rewritten by the model's explicit aliases when one applies, and otherwise clamped
 //! to the nearest weaker level the model takes (the policy son-of-anton's own clamp uses), or the weakest level
-//! above it when nothing is weaker. Unknown words are passed through for the server to judge.
+//! above it when nothing is weaker. `none` (thinking off) is never a clamp target for a level that asks for
+//! thinking. Unknown words are passed through for the server to judge.
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -34,6 +35,7 @@ pub fn translate(
     let mut ranked: Vec<(usize, &String)> = supported
         .iter()
         .filter_map(|s| rank(s).map(|r| (r, s)))
+        .filter(|(r, _)| want == 0 || *r > 0)
         .collect();
     ranked.sort_by_key(|(r, _)| *r);
     let weaker = ranked.iter().rev().find(|(r, _)| *r <= want);
@@ -99,7 +101,8 @@ mod tests {
         assert_eq!(translate("high", &qwen, &none), Some("medium".into()));
         assert_eq!(translate("max", &qwen, &none), Some("xhigh".into()));
         assert_eq!(translate("ultra", &qwen, &none), Some("xhigh".into()));
-        assert_eq!(translate("minimal", &qwen, &none), Some("none".into()));
+        // Asking for a little thinking must not switch it off.
+        assert_eq!(translate("minimal", &qwen, &none), Some("low".into()));
         assert_eq!(translate("xhigh", &qwen, &none), None);
         assert_eq!(translate("low", &qwen, &none), None);
     }
