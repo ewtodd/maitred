@@ -148,6 +148,15 @@ pub fn resolve<'a>(config: &'a Config, name: &str) -> Option<&'a Model> {
     matches.next().is_none().then_some(first)
 }
 
+/// Set the model's `request_overrides` on the request body, replacing what the client sent.
+fn apply_overrides(req: &mut Value, overrides: &serde_json::Map<String, Value>) {
+    if let Some(body) = req.as_object_mut() {
+        for (k, v) in overrides {
+            body.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 fn model_entry(config: &Config, m: &Model, up: &HashMap<String, bool>) -> Value {
     let serving = up.get(&m.upstream).copied().unwrap_or(false);
     let mut e = json!({"id": m.id, "object": "model", "created": 0, "owned_by": m.upstream});
@@ -276,6 +285,7 @@ pub async fn v1(
     }
 
     req["model"] = Value::String(model.upstream_model.clone());
+    apply_overrides(&mut req, &model.request_overrides);
     let rewrites =
         effort::rewrite_request(&mut req, &model.reasoning_efforts, &model.effort_aliases);
     let upstream = &st.config.upstreams[&model.upstream];
@@ -448,6 +458,19 @@ mod tests {
             "keys": []
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn overrides_replace_what_the_client_sent() {
+        let overrides = json!({"response_format": {"type": "json_object"}, "temperature": 0})
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut req = json!({"model": "m", "temperature": 0.7, "messages": []});
+        apply_overrides(&mut req, &overrides);
+        assert_eq!(req["temperature"], 0);
+        assert_eq!(req["response_format"]["type"], "json_object");
+        assert_eq!(req["messages"], json!([]), "other fields are kept");
     }
 
     #[test]

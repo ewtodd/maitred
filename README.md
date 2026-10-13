@@ -92,6 +92,7 @@ and a passthrough.
 | `models[].default_reasoning_effort` | The level the server applies when none is sent. Listed only. |
 | `models[].effort_aliases` | Explicit rewrites applied before clamping, e.g. `{"medium": "high"}`. |
 | `models[].extra` | Extra fields merged into the model's `/v1/models` entry. |
+| `models[].request_overrides` | Top-level fields set on every request for the model, replacing what the client sent. For example, a `response_format` that forces JSON; two ids can then serve one upstream model with different settings. |
 | `modes[]` | `name`, `label` (used in messages), `host` (modes on one host exclude each other), `upstreams`. |
 | `switch_hint` | What an unavailable-model error suggests about the mode; `{mode}` becomes the wanted mode's label. Default `ask the admin to switch to {mode}`. |
 | `keys[].name`, `keys[].env` | The key's name (in logs and messages) and the variable holding its value. |

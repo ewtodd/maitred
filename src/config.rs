@@ -112,6 +112,11 @@ pub struct Model {
     /// Extra fields merged into this model's `/v1/models` entry (capabilities, modalities, ...).
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+    /// Top-level fields set on every request for this model, replacing what the client sent, e.g. a
+    /// `response_format` that forces JSON from a model that would answer in plain text. Two ids can then
+    /// serve one upstream model with different request settings.
+    #[serde(default)]
+    pub request_overrides: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Model {
