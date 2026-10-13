@@ -1,4 +1,4 @@
-//! llm-gateway: an OpenAI-compatible `/v1` front for the house's LLM servers.
+//! maitred: an OpenAI-compatible `/v1` front for self-hosted LLM servers that share GPUs.
 //!
 //! It forwards requests to the server that serves the named model (bodies pass through untouched except
 //! for the model name and the reasoning effort), checks virtual keys, lists every model with its context
@@ -30,7 +30,7 @@ fn config_path() -> Option<PathBuf> {
             return Some(PathBuf::from(p));
         }
     }
-    std::env::var_os("LLM_GATEWAY_CONFIG").map(PathBuf::from)
+    std::env::var_os("MAITRED_CONFIG").map(PathBuf::from)
 }
 
 #[tokio::main]
@@ -40,16 +40,16 @@ async fn main() {
         .with_ansi(false)
         .init();
     let Some(path) = config_path() else {
-        eprintln!("usage: llm-gateway --config FILE (or LLM_GATEWAY_CONFIG)");
+        eprintln!("usage: maitred --config FILE (or MAITRED_CONFIG)");
         std::process::exit(2);
     };
     let config = config::Config::load(&path).unwrap_or_else(|e| {
-        eprintln!("llm-gateway: {e}");
+        eprintln!("maitred: {e}");
         std::process::exit(1);
     });
     let listen = config.listen.clone();
     let state = proxy::AppState::new(config).unwrap_or_else(|e| {
-        eprintln!("llm-gateway: {e}");
+        eprintln!("maitred: {e}");
         std::process::exit(1);
     });
     let app = Router::new()
@@ -63,7 +63,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .unwrap_or_else(|e| {
-            eprintln!("llm-gateway: listen {listen}: {e}");
+            eprintln!("maitred: listen {listen}: {e}");
             std::process::exit(1);
         });
     tracing::info!("listening on {listen}");

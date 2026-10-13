@@ -1,7 +1,7 @@
 { lib, rustPlatform }:
 
 rustPlatform.buildRustPackage {
-  pname = "llm-gateway";
+  pname = "maitred";
   version = "0.1.0";
 
   src = lib.cleanSourceWith {
@@ -23,8 +23,9 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
 
   meta = {
-    description = "OpenAI-compatible /v1 gateway: virtual keys, routing, model metadata, effort clamping, mode-aware errors";
+    description = "OpenAI-compatible /v1 front for self-hosted LLM servers that share GPUs";
+    homepage = "https://github.com/ewtodd/maitred";
     license = lib.licenses.mit;
-    mainProgram = "llm-gateway";
+    mainProgram = "maitred";
   };
 }

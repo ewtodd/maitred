@@ -218,3 +218,26 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_example_config_loads_and_validates() {
+        let config: Config = serde_json::from_str(include_str!("../examples/config.json")).unwrap();
+        config.validate().unwrap();
+        // Every key's model list and every mode's upstreams resolve (validate checks), and each mode
+        // has at least one model to suggest.
+        for mode in &config.modes {
+            assert!(
+                config
+                    .models
+                    .iter()
+                    .any(|m| mode.upstreams.contains(&m.upstream)),
+                "mode {} serves no model",
+                mode.name
+            );
+        }
+    }
+}

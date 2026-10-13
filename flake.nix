@@ -1,10 +1,10 @@
 {
-  description = "llm-gateway: an OpenAI-compatible /v1 front for the house's LLM servers (virtual keys, routing, model metadata, effort clamping, mode-aware errors)";
+  description = "maitred: an OpenAI-compatible /v1 front for self-hosted LLM servers that share GPUs";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
-    { self, nixpkgs }:
+    { nixpkgs, ... }:
     let
       systems = [
         "x86_64-linux"
@@ -13,13 +13,13 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
-      # Callers (the NixOS host) pass their own pkgs so there is one nixpkgs.
-      lib.mkLlmGateway = { pkgs }: pkgs.callPackage ./nix/package.nix { };
-
       packages = forAllSystems (system: rec {
-        llm-gateway = self.lib.mkLlmGateway { pkgs = nixpkgs.legacyPackages.${system}; };
-        default = llm-gateway;
+        maitred = nixpkgs.legacyPackages.${system}.callPackage ./nix/package.nix { };
+        default = maitred;
       });
+
+      # services.maitred; its package is built with the host's own nixpkgs.
+      nixosModules.default = ./nix/module.nix;
 
       devShells = forAllSystems (
         system:

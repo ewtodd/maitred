@@ -1,0 +1,104 @@
+{
+  "listen": "0.0.0.0:4000",
+  "switch_hint": "ask the admin to switch gpu-box to {mode}",
+  "upstreams": {
+    "big": {
+      "base_url": "http://192.168.1.20:8200/v1",
+      "timeout_secs": 3600,
+      "idle_timeout_secs": 3600
+    },
+    "dense": {
+      "base_url": "http://192.168.1.20:8100/v1"
+    },
+    "moe": {
+      "base_url": "http://192.168.1.20:8050/v1"
+    },
+    "embed": {
+      "base_url": "http://127.0.0.1:8082/v1",
+      "timeout_secs": 120
+    },
+    "deepseek": {
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "DEEPSEEK_API_KEY"
+    }
+  },
+  "modes": [
+    {
+      "name": "big",
+      "label": "DeepSeek-V4-Flash",
+      "host": "gpu-box",
+      "upstreams": ["big"]
+    },
+    {
+      "name": "pair",
+      "label": "the Qwen models",
+      "host": "gpu-box",
+      "upstreams": ["dense", "moe"]
+    }
+  ],
+  "models": [
+    {
+      "id": "big/dsv4-flash",
+      "upstream": "big",
+      "upstream_model": "dsv4-flash",
+      "display_name": "DeepSeek-V4-Flash",
+      "context_length": 524288,
+      "reasoning_efforts": ["none", "low", "high", "max"],
+      "default_reasoning_effort": "high",
+      "effort_aliases": { "minimal": "low", "medium": "high", "xhigh": "max" }
+    },
+    {
+      "id": "dense/qwen3.8-27b",
+      "upstream": "dense",
+      "upstream_model": "qwen3.8-27b",
+      "display_name": "Qwen3.8-27B",
+      "context_length": 262144,
+      "reasoning_efforts": ["none", "low", "medium", "xhigh"],
+      "default_reasoning_effort": "xhigh",
+      "extra": { "capabilities": ["vision"] }
+    },
+    {
+      "id": "moe/qwen3.8-flash-next",
+      "upstream": "moe",
+      "upstream_model": "qwen3.8-flash-next",
+      "display_name": "Qwen3.8-Flash-Next",
+      "context_length": 262144,
+      "reasoning_efforts": ["none", "low", "medium", "xhigh"],
+      "default_reasoning_effort": "xhigh"
+    },
+    {
+      "id": "embed/bge-m3",
+      "upstream": "embed",
+      "upstream_model": "bge-m3",
+      "context_length": 8192
+    },
+    {
+      "id": "deepseek/deepseek-flash",
+      "upstream": "deepseek",
+      "upstream_model": "deepseek-flash",
+      "display_name": "DeepSeek API (Flash)",
+      "context_length": 1048576,
+      "reasoning_efforts": ["low", "high", "max"],
+      "default_reasoning_effort": "max"
+    }
+  ],
+  "keys": [
+    { "name": "me", "env": "MAITRED_KEY_ME" },
+    { "name": "webui", "env": "MAITRED_KEY_WEBUI" },
+    {
+      "name": "friend",
+      "env": "MAITRED_KEY_FRIEND",
+      "models": ["big/dsv4-flash", "dense/qwen3.8-27b", "moe/qwen3.8-flash-next"],
+      "rate_limit": { "requests": 30, "per_secs": 60 },
+      "active_hours": {
+        "start": 20,
+        "end": 7,
+        "timezone": "America/New_York",
+        "message": "This key works 20:00-07:00 New York time."
+      }
+    }
+  ],
+  "passthrough": [
+    { "prefix": "/mcp", "target": "http://127.0.0.1:4012", "timeout_secs": 3600 }
+  ]
+}

@@ -1,8 +1,12 @@
 [package]
-name = "llm-gateway"
+name = "maitred"
 version = "0.1.0"
 edition = "2024"
-description = "OpenAI-compatible /v1 gateway for the house's LLM servers: virtual keys, routing, model metadata, effort clamping, mode-aware errors"
+description = "OpenAI-compatible /v1 front for self-hosted LLM servers that share GPUs: virtual keys, routing, model metadata, reasoning-effort translation, and errors that say what is being served instead"
+repository = "https://github.com/ewtodd/maitred"
+readme = "README.md"
+keywords = ["llm", "openai", "gateway", "proxy", "self-hosted"]
+categories = ["web-programming::http-server"]
 license = "MIT"
 
 [dependencies]
