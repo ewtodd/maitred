@@ -1,6 +1,6 @@
 //! Which upstreams are answering, and what to tell a caller whose model is not being served.
 
-use crate::config::{Config, Model};
+use crate::config::{Config, Mode, Model};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -141,6 +141,65 @@ pub fn explain(config: &Config, model: &Model, up: &HashMap<String, bool>) -> Un
     }
 }
 
+/// The model `default_id` names right now: the `default_model` of the mode being served. Not a fallback: a
+/// request for a specific model never lands here; this id is defined as whatever is loaded. Modes are tried in
+/// config order, so with two hosts the first one serving wins.
+pub fn serving_default<'a>(
+    config: &'a Config,
+    up: &HashMap<String, bool>,
+) -> Result<&'a Model, Unavailable> {
+    let is_up = |u: &str| up.get(u).copied().unwrap_or(false);
+    let defaults: Vec<(&Mode, &Model)> = config
+        .modes
+        .iter()
+        .filter_map(|mode| {
+            let id = mode.default_model.as_ref()?;
+            config
+                .models
+                .iter()
+                .find(|m| &m.id == id)
+                .map(|m| (mode, m))
+        })
+        .collect();
+    if let Some((_, m)) = defaults.iter().find(|(_, m)| is_up(&m.upstream)) {
+        return Ok(m);
+    }
+    // A mode whose other servers answer but whose default does not yet is still coming up.
+    if let Some((mode, m)) = defaults
+        .iter()
+        .find(|(mode, _)| mode.upstreams.iter().any(|u| is_up(u)))
+    {
+        return Err(Unavailable {
+            message: format!(
+                "{} is {} ({}), which is still loading on {} (it was just switched or restarted); \
+                 try again in a minute or two.",
+                config.default_id,
+                m.display(),
+                m.id,
+                mode.host
+            ),
+            retry_after: Some(60),
+        });
+    }
+    let host = defaults
+        .first()
+        .map(|(mode, _)| mode.host.as_str())
+        .unwrap_or("the server");
+    Err(Unavailable {
+        message: format!(
+            "{} has nothing to serve: {host} is not serving any model right now (it may be switching or \
+             restarting). Try again in a few minutes.",
+            config.default_id
+        ),
+        retry_after: Some(120),
+    })
+}
+
+/// Whether `name` is the default id and some mode names a model for it.
+pub fn is_default(config: &Config, name: &str) -> bool {
+    name == config.default_id && config.modes.iter().any(|m| m.default_model.is_some())
+}
+
 fn hint(config: &Config, wanted_label: &str) -> String {
     config.switch_hint.replace("{mode}", wanted_label)
 }
@@ -167,8 +226,10 @@ mod tests {
                 "gufo": {"base_url": "http://c/v1"}
             },
             "modes": [
-                {"name": "ds4", "label": "DeepSeek-V4-Flash", "host": "son-of-anton", "upstreams": ["unholy"]},
-                {"name": "qwen", "label": "the Qwen models", "host": "son-of-anton", "upstreams": ["radiance", "gufo"]}
+                {"name": "ds4", "label": "DeepSeek-V4-Flash", "host": "son-of-anton", "upstreams": ["unholy"],
+                 "default_model": "unholy/dsv4-flash"},
+                {"name": "qwen", "label": "the Qwen models", "host": "son-of-anton", "upstreams": ["radiance", "gufo"],
+                 "default_model": "radiance/qwen3.8-27b"}
             ],
             "models": [
                 {"id": "unholy/dsv4-flash", "upstream": "unholy", "upstream_model": "dsv4-flash", "display_name": "DeepSeek-V4-Flash"},
@@ -242,6 +303,49 @@ mod tests {
         assert!(!Probes::new(HashMap::new()).is_up(&base).await);
         let keyed = Probes::new([(base.clone(), "sk-up".to_string())].into());
         assert!(keyed.is_up(&base).await);
+    }
+
+    #[test]
+    fn the_default_is_whatever_mode_is_loaded() {
+        let c = config();
+        let ds4 = up(&[("unholy", true), ("radiance", false), ("gufo", false)]);
+        assert_eq!(serving_default(&c, &ds4).unwrap().id, "unholy/dsv4-flash");
+        let qwen = up(&[("unholy", false), ("radiance", true), ("gufo", true)]);
+        assert_eq!(
+            serving_default(&c, &qwen).unwrap().id,
+            "radiance/qwen3.8-27b"
+        );
+    }
+
+    #[test]
+    fn the_default_waits_while_its_mode_loads_and_while_nothing_is_up() {
+        let c = config();
+        // Qwen mode is coming up: gufo answers, its default (radiance) not yet.
+        let u = serving_default(
+            &c,
+            &up(&[("unholy", false), ("radiance", false), ("gufo", true)]),
+        )
+        .unwrap_err();
+        assert!(u.message.contains("still loading"), "{}", u.message);
+        assert_eq!(u.retry_after, Some(60));
+        let u = serving_default(&c, &up(&[])).unwrap_err();
+        assert!(u.message.contains("not serving any model"), "{}", u.message);
+        assert_eq!(u.retry_after, Some(120));
+    }
+
+    #[test]
+    fn only_the_default_id_with_mode_defaults_is_the_default() {
+        let c = config();
+        assert!(is_default(&c, "default"));
+        assert!(!is_default(&c, "unholy/dsv4-flash"));
+        let mut bare = config();
+        for m in &mut bare.modes {
+            m.default_model = None;
+        }
+        assert!(
+            !is_default(&bare, "default"),
+            "no mode names one: the id means nothing"
+        );
     }
 
     #[test]

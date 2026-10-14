@@ -49,6 +49,12 @@ you what is being served and how to get yours, instead of a connection error:
   - the other mode is serving: use its models, or ask the admin to switch;
   - the wanted mode is partly up: still loading, with `Retry-After`;
   - nothing is up: switching or restarting, with `Retry-After`.
+- **Whatever is loaded.** Each mode can name a default model, and one more model id (`default_id`,
+  `default` unless set) then means "the loaded mode's default". A request for it goes to whichever mode is
+  serving right now, with its effort translated for that model, so a scheduled job that asks for it runs
+  on whatever the box has up. It is not a fallback: a request that names a model still gets that model or
+  the not-loaded error. `/v1/models` lists the id first, with the live model's window and efforts and
+  `resolves_to` naming it; while nothing is up it answers like any unavailable model.
 - **MCP gateway.** `/mcp` is one MCP endpoint (Streamable HTTP, JSON responses) in front of any number of
   stdio MCP servers:
   - each server is started on first use, kept running, and restarted if it exits;
@@ -94,6 +100,8 @@ and a passthrough.
 | `models[].extra` | Extra fields merged into the model's `/v1/models` entry. |
 | `models[].request_overrides` | Top-level fields set on every request for the model, replacing what the client sent. For example, a `response_format` that forces JSON; two ids can then serve one upstream model with different settings. |
 | `modes[]` | `name`, `label` (used in messages), `host` (modes on one host exclude each other), `upstreams`. |
+| `modes[].default_model` | The model `default_id` names while this mode is serving; one of the mode's own. |
+| `default_id` | The id meaning "the loaded mode's default model" (default `default`). Must not be a model id; keys name it like one. |
 | `switch_hint` | What an unavailable-model error suggests about the mode; `{mode}` becomes the wanted mode's label. Default `ask the admin to switch to {mode}`. |
 | `keys[].name`, `keys[].env` | The key's name (in logs and messages) and the variable holding its value. |
 | `keys[].models` | Model ids it may use; default `["*"]`. |

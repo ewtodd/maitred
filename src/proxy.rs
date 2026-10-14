@@ -192,23 +192,58 @@ fn model_entry(config: &Config, m: &Model, up: &HashMap<String, bool>) -> Value 
     e
 }
 
-/// `GET /v1/models`: every model, whether or not its server is up, with live status. A valid key narrows the
-/// list to the models it may use; no key lists them all (as Bifrost did).
+/// The `/v1/models` entry for the default id: the model it names right now, listed under the default id with
+/// `resolves_to` saying which (its window and efforts follow the loaded mode); with nothing loaded, why.
+fn default_entry(config: &Config, up: &HashMap<String, bool>) -> Value {
+    match status::serving_default(config, up) {
+        Ok(m) => {
+            let mut e = model_entry(config, m, up);
+            e["id"] = json!(config.default_id);
+            e["name"] = json!(format!("Whatever is loaded: {}", m.display()));
+            e["owned_by"] = json!("maitred");
+            e["resolves_to"] = json!(m.id);
+            e
+        }
+        Err(u) => json!({
+            "id": config.default_id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "maitred",
+            "name": "Whatever is loaded",
+            "status": "unavailable",
+            "status_reason": u.message,
+        }),
+    }
+}
+
+/// `GET /v1/models`: every model, whether or not its server is up, with live status, led by the default id
+/// when modes name one. A valid key narrows the list to the models it may use; no key lists them all (as
+/// Bifrost did).
 pub async fn models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let key = st.keys.identify(&headers).ok();
     let up = st.probes.snapshot(&st.config).await;
-    let data: Vec<Value> = st
-        .config
-        .models
-        .iter()
-        .filter(|m| key.is_none_or(|k| auth::may_use(k, &m.id)))
-        .map(|m| model_entry(&st.config, m, &up))
-        .collect();
+    let mut data: Vec<Value> = Vec::new();
+    if status::is_default(&st.config, &st.config.default_id)
+        && key.is_none_or(|k| auth::may_use(k, &st.config.default_id))
+    {
+        data.push(default_entry(&st.config, &up));
+    }
+    data.extend(
+        st.config
+            .models
+            .iter()
+            .filter(|m| key.is_none_or(|k| auth::may_use(k, &m.id)))
+            .map(|m| model_entry(&st.config, m, &up)),
+    );
     Json(json!({"object": "list", "data": data})).into_response()
 }
 
 /// `GET /v1/models/{id}`.
 pub async fn model(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if status::is_default(&st.config, &id) {
+        let up = st.probes.snapshot(&st.config).await;
+        return Json(default_entry(&st.config, &up)).into_response();
+    }
     let Some(m) = resolve(&st.config, &id) else {
         return error(
             StatusCode::NOT_FOUND,
@@ -252,22 +287,49 @@ pub async fn v1(
             "The request names no model.",
         );
     };
-    let Some(model) = resolve(&st.config, &name) else {
-        let ids: Vec<&str> = st
-            .config
-            .models
-            .iter()
-            .filter(|m| auth::may_use(key, &m.id))
-            .map(|m| m.id.as_str())
-            .collect();
-        return error(
-            StatusCode::NOT_FOUND,
-            "invalid_request_error",
-            "model_not_found",
-            format!("Unknown model {name}. Available: {}.", ids.join(", ")),
-        );
+    // The default id is whatever is loaded right now, resolved here, never a fallback for a named model.
+    let default = status::is_default(&st.config, &name);
+    let model = if default {
+        let up = st.probes.snapshot(&st.config).await;
+        match status::serving_default(&st.config, &up) {
+            Ok(m) => m,
+            Err(u) => {
+                tracing::info!(key = %key.name, model = %name, path = %rest, status = 503, ms = started.elapsed().as_millis() as u64, "unavailable: {}", u.message);
+                return unavailable(u);
+            }
+        }
+    } else {
+        let Some(model) = resolve(&st.config, &name) else {
+            let mut ids: Vec<&str> = st
+                .config
+                .models
+                .iter()
+                .filter(|m| auth::may_use(key, &m.id))
+                .map(|m| m.id.as_str())
+                .collect();
+            if status::is_default(&st.config, &st.config.default_id)
+                && auth::may_use(key, &st.config.default_id)
+            {
+                ids.insert(0, &st.config.default_id);
+            }
+            return error(
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                "model_not_found",
+                format!("Unknown model {name}. Available: {}.", ids.join(", ")),
+            );
+        };
+        model
     };
-    if !auth::may_use(key, &model.id) {
+    // A key is granted the id it asked for: the default id itself, not whatever it resolves to now.
+    if !auth::may_use(
+        key,
+        if default {
+            &st.config.default_id
+        } else {
+            &model.id
+        },
+    ) {
         let allowed = st
             .config
             .models
@@ -338,6 +400,7 @@ pub async fn v1(
     tracing::info!(
         key = %key.name,
         model = %model.id,
+        requested = %name,
         path = %rest,
         status = resp.status().as_u16(),
         ms = started.elapsed().as_millis() as u64,
@@ -458,6 +521,108 @@ mod tests {
             "keys": []
         }))
         .unwrap()
+    }
+
+    /// A fake upstream that answers `/models` and echoes a chat request's body back.
+    async fn echo_upstream() -> String {
+        let app = axum::Router::new()
+            .route("/v1/models", axum::routing::get(|| async { "{}" }))
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|body: Bytes| async move { body }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        base
+    }
+
+    async fn post(st: &Arc<AppState>, secret: &str, body: Value) -> (StatusCode, Value) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {secret}")).unwrap(),
+        );
+        let resp = v1(
+            State(st.clone()),
+            Path("chat/completions".to_string()),
+            headers,
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_default_id_serves_whatever_is_loaded_and_is_not_a_fallback() {
+        // ds4 is loaded (its upstream answers); qwen's upstream is down.
+        let loaded = echo_upstream().await;
+        let config: Config = serde_json::from_value(json!({
+            "listen": "127.0.0.1:0",
+            "default_id": "alwaysserve",
+            "upstreams": {"unholy": {"base_url": loaded}, "radiance": {"base_url": "http://127.0.0.1:1/v1"}},
+            "modes": [
+                {"name": "ds4", "label": "DeepSeek-V4-Flash", "host": "gpu", "upstreams": ["unholy"],
+                 "default_model": "unholy/dsv4-flash"},
+                {"name": "qwen", "label": "the Qwen models", "host": "gpu", "upstreams": ["radiance"],
+                 "default_model": "radiance/qwen3.8-27b"}
+            ],
+            "models": [
+                {"id": "unholy/dsv4-flash", "upstream": "unholy", "upstream_model": "dsv4-flash",
+                 "reasoning_efforts": ["none", "low", "high", "max"], "effort_aliases": {"xhigh": "max"}},
+                {"id": "radiance/qwen3.8-27b", "upstream": "radiance", "upstream_model": "qwen3.8-27b"}
+            ],
+            "keys": [
+                {"name": "cron", "env": "UNUSED", "models": ["alwaysserve"]},
+                {"name": "all", "env": "UNUSED"}
+            ]
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        let keys = config.keys.clone();
+        let mut st = AppState::new(config).unwrap();
+        st.keys = Keys::new(vec![
+            ("sk-cron".to_string(), keys[0].clone()),
+            ("sk-all".to_string(), keys[1].clone()),
+        ]);
+        let st = Arc::new(st);
+
+        // The default id reaches the loaded model, its effort translated for that model; a key granted only
+        // the default id may use it.
+        let (status, echoed) = post(
+            &st,
+            "sk-cron",
+            json!({"model": "alwaysserve", "reasoning_effort": "xhigh", "messages": []}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{echoed}");
+        assert_eq!(echoed["model"], "dsv4-flash");
+        assert_eq!(echoed["reasoning_effort"], "max");
+
+        // A model named outright is not rerouted to what is loaded: it is refused as not loaded.
+        let (status, err) = post(
+            &st,
+            "sk-all",
+            json!({"model": "radiance/qwen3.8-27b", "messages": []}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{err}");
+        assert_eq!(err["error"]["code"], "model_not_loaded");
+
+        // The listing leads with the default id and says what it means right now.
+        let resp = models(State(st.clone()), HeaderMap::new()).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listing: Value = serde_json::from_slice(&bytes).unwrap();
+        let first = &listing["data"][0];
+        assert_eq!(first["id"], "alwaysserve");
+        assert_eq!(first["resolves_to"], "unholy/dsv4-flash");
+        assert_eq!(first["status"], "serving");
     }
 
     #[test]

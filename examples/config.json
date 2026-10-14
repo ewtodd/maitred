@@ -27,13 +27,15 @@
       "name": "big",
       "label": "DeepSeek-V4-Flash",
       "host": "gpu-box",
-      "upstreams": ["big"]
+      "upstreams": ["big"],
+      "default_model": "big/dsv4-flash"
     },
     {
       "name": "pair",
       "label": "the Qwen models",
       "host": "gpu-box",
-      "upstreams": ["dense", "moe"]
+      "upstreams": ["dense", "moe"],
+      "default_model": "dense/qwen3.8-27b"
     }
   ],
   "models": [
