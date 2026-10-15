@@ -92,6 +92,7 @@ and a passthrough.
 | `models[].upstream` | Key into `upstreams`. |
 | `models[].upstream_model` | The name the server serves it under. |
 | `models[].display_name` | Human name used in error messages. |
+| `models[].hidden` | Omitted from the `/v1/models` listing; still resolvable and served by an explicit request. |
 | `models[].context_length` | Listed as `context_length` and `max_model_len`. |
 | `models[].max_completion_tokens` | Listed when set. |
 | `models[].reasoning_efforts` | Levels the server takes, weakest first. Empty means not a reasoning model; the field passes through untouched. |

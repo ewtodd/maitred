@@ -232,6 +232,7 @@ pub async fn models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         st.config
             .models
             .iter()
+            .filter(|m| !m.hidden)
             .filter(|m| key.is_none_or(|k| auth::may_use(k, &m.id)))
             .map(|m| model_entry(&st.config, m, &up)),
     );
@@ -304,6 +305,7 @@ pub async fn v1(
                 .config
                 .models
                 .iter()
+                .filter(|m| !m.hidden)
                 .filter(|m| auth::may_use(key, &m.id))
                 .map(|m| m.id.as_str())
                 .collect();
@@ -334,6 +336,7 @@ pub async fn v1(
             .config
             .models
             .iter()
+            .filter(|m| !m.hidden)
             .filter(|m| auth::may_use(key, &m.id))
             .map(|m| m.id.clone())
             .collect();
@@ -623,6 +626,50 @@ mod tests {
         assert_eq!(first["id"], "alwaysserve");
         assert_eq!(first["resolves_to"], "unholy/dsv4-flash");
         assert_eq!(first["status"], "serving");
+    }
+
+    #[tokio::test]
+    async fn hidden_models_leave_the_listing_but_stay_resolvable_and_served() {
+        let loaded = echo_upstream().await;
+        let config: Config = serde_json::from_value(json!({
+            "listen": "127.0.0.1:0",
+            "upstreams": {"embed": {"base_url": loaded}},
+            "models": [
+                {"id": "embed/bge-m3", "upstream": "embed", "upstream_model": "bge-m3", "hidden": true}
+            ],
+            "keys": [{"name": "all", "env": "UNUSED"}]
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        let keys = config.keys.clone();
+        let mut st = AppState::new(config).unwrap();
+        st.keys = Keys::new(vec![("sk-all".to_string(), keys[0].clone())]);
+        let st = Arc::new(st);
+
+        // The listing omits the hidden model entirely.
+        let resp = models(State(st.clone()), HeaderMap::new()).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listing: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(listing["data"], json!([]));
+
+        // Asked for by name it is still described and served.
+        let resp = model(State(st.clone()), Path("embed/bge-m3".to_string())).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let entry: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(entry["id"], "embed/bge-m3");
+
+        let (status, echoed) = post(
+            &st,
+            "sk-all",
+            json!({"model": "bge-m3", "messages": []}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{echoed}");
+        assert_eq!(echoed["model"], "bge-m3");
     }
 
     #[test]

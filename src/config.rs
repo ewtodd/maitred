@@ -117,6 +117,9 @@ pub struct Model {
     /// Explicit rewrites applied before clamping, e.g. `{"medium": "high"}`.
     #[serde(default)]
     pub effort_aliases: HashMap<String, String>,
+    /// Omitted from the `/v1/models` listing; still resolvable and served by an explicit request.
+    #[serde(default)]
+    pub hidden: bool,
     /// Extra fields merged into this model's `/v1/models` entry (capabilities, modalities, ...).
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
