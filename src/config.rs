@@ -20,10 +20,10 @@ pub struct Config {
     /// "ask the admin to switch son-of-anton to {mode}". `{mode}` is the wanted mode's label.
     #[serde(default = "default_switch_hint")]
     pub switch_hint: String,
-    /// The model id that means "whatever is loaded": a request for it goes to the `default_model` of the mode
-    /// serving right now. Keys name it like any model id.
-    #[serde(default = "default_default_id")]
-    pub default_id: String,
+    /// The routed id (`auto`), on when some model has a `tier`: a request for it goes to a model maitred picks.
+    /// Keys name it like any model id.
+    #[serde(default)]
+    pub router: Router,
     pub keys: Vec<Key>,
     /// Paths forwarded verbatim (headers included) to another server, e.g. `/mcp` to Bifrost.
     #[serde(default)]
@@ -35,10 +35,6 @@ pub struct Config {
 
 fn default_switch_hint() -> String {
     "ask the admin to switch to {mode}".to_string()
-}
-
-fn default_default_id() -> String {
-    "default".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +76,11 @@ pub struct Upstream {
     pub idle_timeout_secs: u64,
     #[serde(default = "default_connect")]
     pub connect_timeout_secs: u64,
+    /// How many requests the server runs at once (its parallel slots). The router counts a model whose server has
+    /// this many in flight as full and starts conversations elsewhere; a request that names the model still goes
+    /// to it and queues there. Unset: never full.
+    #[serde(default)]
+    pub slots: Option<u32>,
 }
 
 fn default_timeout() -> u64 {
@@ -120,6 +121,10 @@ pub struct Model {
     /// Omitted from the `/v1/models` listing; still resolvable and served by an explicit request.
     #[serde(default)]
     pub hidden: bool,
+    /// Strength for the router, higher is stronger; to it, models of one tier are interchangeable. Only models
+    /// with a tier are routed to.
+    #[serde(default)]
+    pub tier: Option<u32>,
     /// Extra fields merged into this model's `/v1/models` entry (capabilities, modalities, ...).
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -146,13 +151,53 @@ pub struct Mode {
     #[serde(default = "default_host")]
     pub host: String,
     pub upstreams: Vec<String>,
-    /// The model a request for `default_id` gets while this mode is serving. One of the mode's own models.
-    #[serde(default)]
-    pub default_model: Option<String>,
 }
 
 fn default_host() -> String {
     "the server".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Router {
+    /// The id clients ask for to be routed. Must not be a model id.
+    #[serde(default = "default_router_id")]
+    pub id: String,
+    /// A conversation estimated below this many tokens may move to another model at a new user message; a
+    /// longer one stays on the model that has it cached for as long as that model serves and fits it.
+    #[serde(default = "default_move_below")]
+    pub move_below_tokens: u64,
+    /// How long a quiet conversation's model is remembered.
+    #[serde(default = "default_forget_after")]
+    pub forget_after_secs: u64,
+    /// A file each routing decision is appended to, one JSON object per line.
+    #[serde(default)]
+    pub decision_log: Option<String>,
+    /// Also write the last user message's text into the decision log (examples for a classifier).
+    #[serde(default)]
+    pub log_prompts: bool,
+}
+
+impl Default for Router {
+    fn default() -> Router {
+        Router {
+            id: default_router_id(),
+            move_below_tokens: default_move_below(),
+            forget_after_secs: default_forget_after(),
+            decision_log: None,
+            log_prompts: false,
+        }
+    }
+}
+
+fn default_router_id() -> String {
+    "auto".to_string()
+}
+fn default_move_below() -> u64 {
+    16384
+}
+fn default_forget_after() -> u64 {
+    6 * 3600
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -242,11 +287,16 @@ impl Config {
                 ));
             }
         }
-        if ids.contains(self.default_id.as_str()) {
+        if self.models.iter().any(|m| m.tier.is_some()) && ids.contains(self.router.id.as_str()) {
             return Err(format!(
-                "default_id {} is also a model id; pick another",
-                self.default_id
+                "router id {} is also a model id; pick another",
+                self.router.id
             ));
+        }
+        for (name, u) in &self.upstreams {
+            if u.slots == Some(0) {
+                return Err(format!("upstream {name}: slots must be at least 1"));
+            }
         }
         for mode in &self.modes {
             for u in &mode.upstreams {
@@ -254,22 +304,10 @@ impl Config {
                     return Err(format!("mode {}: unknown upstream {u}", mode.name));
                 }
             }
-            if let Some(d) = &mode.default_model {
-                match self.models.iter().find(|m| &m.id == d) {
-                    None => return Err(format!("mode {}: unknown default model {d}", mode.name)),
-                    Some(m) if !mode.upstreams.contains(&m.upstream) => {
-                        return Err(format!(
-                            "mode {}: default model {d} is not served by the mode's upstreams",
-                            mode.name
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
         }
         for k in &self.keys {
             for m in &k.models {
-                if m != "*" && m != &self.default_id && !ids.contains(m.as_str()) {
+                if m != "*" && m != &self.router.id && !ids.contains(m.as_str()) {
                     return Err(format!("key {}: unknown model {m}", k.name));
                 }
             }
@@ -295,41 +333,23 @@ impl Config {
 mod tests {
     use super::*;
 
-    fn two_modes(default_id: &str, ds4_default: &str) -> Config {
-        serde_json::from_value(serde_json::json!({
-            "listen": "127.0.0.1:0",
-            "default_id": default_id,
-            "upstreams": {"unholy": {"base_url": "http://a/v1"}, "radiance": {"base_url": "http://b/v1"}},
-            "modes": [
-                {"name": "ds4", "label": "DS4", "upstreams": ["unholy"], "default_model": ds4_default},
-                {"name": "qwen", "label": "Qwen", "upstreams": ["radiance"], "default_model": "radiance/qwen"}
-            ],
-            "models": [
-                {"id": "unholy/ds4", "upstream": "unholy", "upstream_model": "ds4"},
-                {"id": "radiance/qwen", "upstream": "radiance", "upstream_model": "qwen"}
-            ],
-            "keys": [{"name": "cron", "env": "X", "models": [default_id]}]
-        }))
-        .unwrap()
-    }
-
     #[test]
-    fn a_mode_default_must_be_one_of_its_own_models() {
-        two_modes("alwaysserve", "unholy/ds4").validate().unwrap();
-        let err = two_modes("alwaysserve", "radiance/qwen")
-            .validate()
-            .unwrap_err();
-        assert!(err.contains("not served by the mode"), "{err}");
-        let err = two_modes("alwaysserve", "nope/x").validate().unwrap_err();
-        assert!(err.contains("unknown default model"), "{err}");
-    }
-
-    #[test]
-    fn the_default_id_cannot_shadow_a_model() {
-        let err = two_modes("unholy/ds4", "unholy/ds4")
-            .validate()
-            .unwrap_err();
+    fn the_router_id_cannot_shadow_a_model_and_slots_are_positive() {
+        let routed = |router_id: &str, slots: u32| -> Config {
+            serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1:0",
+                "router": {"id": router_id},
+                "upstreams": {"unholy": {"base_url": "http://a/v1", "slots": slots}},
+                "models": [{"id": "unholy/ds4", "upstream": "unholy", "upstream_model": "ds4", "tier": 3}],
+                "keys": [{"name": "app", "env": "X", "models": [router_id]}]
+            }))
+            .unwrap()
+        };
+        routed("auto", 1).validate().unwrap();
+        let err = routed("unholy/ds4", 1).validate().unwrap_err();
         assert!(err.contains("also a model id"), "{err}");
+        let err = routed("auto", 0).validate().unwrap_err();
+        assert!(err.contains("slots"), "{err}");
     }
 
     #[test]

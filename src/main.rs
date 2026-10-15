@@ -10,6 +10,7 @@ mod config;
 mod effort;
 mod mcp;
 mod proxy;
+mod router;
 mod status;
 
 use axum::Router;

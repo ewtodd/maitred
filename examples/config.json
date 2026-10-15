@@ -27,15 +27,13 @@
       "name": "big",
       "label": "DeepSeek-V4-Flash",
       "host": "gpu-box",
-      "upstreams": ["big"],
-      "default_model": "big/dsv4-flash"
+      "upstreams": ["big"]
     },
     {
       "name": "pair",
       "label": "the Qwen models",
       "host": "gpu-box",
-      "upstreams": ["dense", "moe"],
-      "default_model": "dense/qwen3.8-27b"
+      "upstreams": ["dense", "moe"]
     }
   ],
   "models": [
@@ -47,7 +45,8 @@
       "context_length": 524288,
       "reasoning_efforts": ["none", "low", "high", "max"],
       "default_reasoning_effort": "high",
-      "effort_aliases": { "minimal": "low", "medium": "high", "xhigh": "max" }
+      "effort_aliases": { "minimal": "low", "medium": "high", "xhigh": "max" },
+      "tier": 3
     },
     {
       "id": "dense/qwen3.8-27b",
@@ -57,7 +56,8 @@
       "context_length": 262144,
       "reasoning_efforts": ["none", "low", "medium", "xhigh"],
       "default_reasoning_effort": "xhigh",
-      "extra": { "capabilities": ["vision"] }
+      "extra": { "capabilities": ["vision"] },
+      "tier": 2
     },
     {
       "id": "moe/qwen3.8-flash-next",
@@ -66,7 +66,8 @@
       "display_name": "Qwen3.8-Flash-Next",
       "context_length": 262144,
       "reasoning_efforts": ["none", "low", "medium", "xhigh"],
-      "default_reasoning_effort": "xhigh"
+      "default_reasoning_effort": "xhigh",
+      "tier": 2
     },
     {
       "id": "embed/bge-m3",

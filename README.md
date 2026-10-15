@@ -49,12 +49,24 @@ you what is being served and how to get yours, instead of a connection error:
   - the other mode is serving: use its models, or ask the admin to switch;
   - the wanted mode is partly up: still loading, with `Retry-After`;
   - nothing is up: switching or restarting, with `Retry-After`.
-- **Whatever is loaded.** Each mode can name a default model, and one more model id (`default_id`,
-  `default` unless set) then means "the loaded mode's default". A request for it goes to whichever mode is
-  serving right now, with its effort translated for that model, so a scheduled job that asks for it runs
-  on whatever the box has up. It is not a fallback: a request that names a model still gets that model or
-  the not-loaded error. `/v1/models` lists the id first, with the live model's window and efforts and
-  `resolves_to` naming it; while nothing is up it answers like any unavailable model.
+- **Picking the model (`auto`).** Give models a `tier` (higher is stronger), and one more id, `auto` unless
+  set, leaves the choice to maitred. It picks among the tiered models whose servers answer and whose windows
+  fit the conversation: the strongest with a free slot (`slots`), then the strongest busy one, with ties going
+  to the one with fewer requests in flight. Moving a conversation makes the new model re-read all of it, so
+  the choice is cache-aware:
+  - a conversation is recognised by its opening: the key, the instructions, and everything up to the first
+    user message;
+  - inside a tool loop it stays on its model;
+  - at a new user message, a conversation shorter than `move_below_tokens` takes the best model on offer,
+    while a longer one stays where it is cached;
+  - it moves anyway when its model stops answering or it outgrows the model's window.
+
+  A scheduled job that asks for `auto` runs on whatever is up, with its effort translated for that model. It
+  is not a fallback: a request that names a model still gets that model or the not-loaded error. A routed
+  request whose server turns out to be down is routed once more. `/v1/models` lists `auto` first,
+  with the largest window and every effort level among the routed models serving now, and `routes_to`
+  naming them. `decision_log` records each decision as a JSON line. A Responses request with
+  `previous_response_id` cannot be routed: the stored response lives on one server.
 - **MCP gateway.** `/mcp` is one MCP endpoint (Streamable HTTP, JSON responses) in front of any number of
   stdio MCP servers:
   - each server is started on first use, kept running, and restarted if it exits;
@@ -73,8 +85,8 @@ nix run github:ewtodd/maitred -- --config config.json    # or: cargo build --rel
 
 The config path can also come from `MAITRED_CONFIG`. Secrets are never in the file: each key and each
 upstream API key names an environment variable. [`examples/config.json`](examples/config.json) is a
-complete example: one GPU box with two modes, an embedding server, a hosted API, three keys, an MCP server
-and a passthrough.
+complete example: one GPU box with two modes and three tiered models behind `auto`, an embedding server, a
+hosted API, three keys, an MCP server and a passthrough.
 
 `GET /health` answers `ok`.
 
@@ -88,11 +100,13 @@ and a passthrough.
 | `upstreams.<name>.timeout_secs` | Whole-request timeout (default 1800). |
 | `upstreams.<name>.idle_timeout_secs` | Longest silence between streamed chunks (default 300). |
 | `upstreams.<name>.connect_timeout_secs` | Default 5. |
+| `upstreams.<name>.slots` | Requests the server runs at once. `auto` counts its models as full while this many are in flight; a named request still goes there and queues. Unset: never full. |
 | `models[].id` | The id clients use and `/v1/models` lists, conventionally `provider/name`. |
 | `models[].upstream` | Key into `upstreams`. |
 | `models[].upstream_model` | The name the server serves it under. |
 | `models[].display_name` | Human name used in error messages. |
 | `models[].hidden` | Omitted from the `/v1/models` listing; still resolvable and served by an explicit request. |
+| `models[].tier` | Strength for `auto`, higher is stronger; models of one tier are interchangeable to it. Only tiered models are routed to. |
 | `models[].context_length` | Listed as `context_length` and `max_model_len`. |
 | `models[].max_completion_tokens` | Listed when set. |
 | `models[].reasoning_efforts` | Levels the server takes, weakest first. Empty means not a reasoning model; the field passes through untouched. |
@@ -101,9 +115,12 @@ and a passthrough.
 | `models[].extra` | Extra fields merged into the model's `/v1/models` entry. |
 | `models[].request_overrides` | Top-level fields set on every request for the model, replacing what the client sent. For example, a `response_format` that forces JSON; two ids can then serve one upstream model with different settings. |
 | `modes[]` | `name`, `label` (used in messages), `host` (modes on one host exclude each other), `upstreams`. |
-| `modes[].default_model` | The model `default_id` names while this mode is serving; one of the mode's own. |
-| `default_id` | The id meaning "the loaded mode's default model" (default `default`). Must not be a model id; keys name it like one. |
 | `switch_hint` | What an unavailable-model error suggests about the mode; `{mode}` becomes the wanted mode's label. Default `ask the admin to switch to {mode}`. |
+| `router.id` | The routed id (default `auto`), on when some model has a `tier`. Must not be a model id; keys name it like one. |
+| `router.move_below_tokens` | A conversation estimated below this (default 16384) may move to another model at a new user message; a longer one stays where it is cached. |
+| `router.forget_after_secs` | How long a quiet conversation's model is remembered (default 21600, six hours). |
+| `router.decision_log` | A file each routing decision is appended to, one JSON object per line. Under the NixOS module, put it in `/var/lib/maitred`. |
+| `router.log_prompts` | Also write the last user message's text into the decision log. Default false. |
 | `keys[].name`, `keys[].env` | The key's name (in logs and messages) and the variable holding its value. |
 | `keys[].models` | Model ids it may use; default `["*"]`. |
 | `keys[].rate_limit` | `{requests, per_secs}`. |
@@ -119,6 +136,8 @@ The config is checked at startup. maitred refuses to start on:
 
 - unknown upstreams;
 - duplicate model ids;
+- a router id that is also a model id;
+- `slots` of 0;
 - aliases or defaults outside the model's efforts;
 - key model lists naming unknown models;
 - MCP grants naming unknown servers;
@@ -131,12 +150,13 @@ Every error has the OpenAI shape: `{"error": {"message", "type", "code"}}`.
 | Status | `code` | When |
 | --- | --- | --- |
 | 400 | `invalid_json`, `missing_model` | The body isn't JSON or has no `model`. |
+| 400 | `context_length_exceeded`, `unsupported_parameter` | A routed conversation longer than every tiered model's window, or a routed Responses request with `previous_response_id`. |
 | 401 | `missing_api_key`, `invalid_api_key` | No key, or an unknown one. |
 | 403 | `key_inactive`, `model_not_allowed`, `mcp_not_allowed` | Outside the key's hours (with its message), a model it may not use (the message lists what it can), or `/mcp` for a key with no MCP grants. |
 | 404 | `model_not_found` | Unknown model (the message lists the configured ones). |
 | 429 | `rate_limit_exceeded` | With `Retry-After`. |
 | 502 | `upstream_error` | The upstream failed mid-request. |
-| 503 | `model_not_loaded` (type `model_unavailable`) | The model's server isn't up. The message says what to use instead. `Retry-After` is set only when waiting will help. |
+| 503 | `model_not_loaded` (type `model_unavailable`) | The model's server isn't up, or no routed model that fits the conversation is. The message says what to use instead. `Retry-After` is set only when waiting will help. |
 | 504 | `upstream_timeout` | The upstream timed out. |
 
 A client should treat a `model_not_loaded` without `Retry-After` as "fall back or tell the user", not as an
