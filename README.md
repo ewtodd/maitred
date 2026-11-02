@@ -65,8 +65,10 @@ you what is being served and how to get yours, instead of a connection error:
   is not a fallback: a request that names a model still gets that model or the not-loaded error. A routed
   request whose server turns out to be down is routed once more. `/v1/models` lists `auto` first,
   with the largest window and every effort level among the routed models serving now, and `routes_to`
-  naming them. `decision_log` records each decision as a JSON line. A Responses request with
-  `previous_response_id` cannot be routed: the stored response lives on one server.
+  naming them. Every answer carries an `x-maitred-model` header naming the model that served it, so a
+  client that asked for `auto` can tell which one it got. `decision_log` records each decision as a JSON
+  line. A Responses request with `previous_response_id` cannot be routed: the stored response lives on
+  one server.
 - **MCP gateway.** `/mcp` is one MCP endpoint (Streamable HTTP, JSON responses) in front of any number of
   stdio MCP servers:
   - each server is started on first use, kept running, and restarted if it exits;

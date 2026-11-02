@@ -520,11 +520,18 @@ pub async fn v1(
             effort = %effort_log.join(","),
             "request"
         );
-        return relay(
+        let mut answer = relay(
             resp,
             Duration::from_secs(upstream.idle_timeout_secs),
             Some(in_flight),
         );
+        // Name the model that answered: for the routed id, the one it picked.
+        if let Ok(id) = HeaderValue::from_str(&model.id) {
+            answer
+                .headers_mut()
+                .insert(HeaderName::from_static("x-maitred-model"), id);
+        }
+        return answer;
     }
 }
 
@@ -704,6 +711,15 @@ mod tests {
     }
 
     async fn post(st: &Arc<AppState>, secret: &str, body: Value) -> (StatusCode, Value) {
+        let (status, _, body) = post_full(st, secret, body).await;
+        (status, body)
+    }
+
+    async fn post_full(
+        st: &Arc<AppState>,
+        secret: &str,
+        body: Value,
+    ) -> (StatusCode, HeaderMap, Value) {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -717,10 +733,37 @@ mod tests {
         )
         .await;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap())
+        (status, headers, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn every_answer_names_the_model_that_served_it() {
+        let st = routed_state(echo_upstream().await).await;
+        let (status, headers, body) = post_full(
+            &st,
+            "sk-app",
+            auto(json!([{"role": "user", "content": "hi"}])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            headers["x-maitred-model"], "big/strong",
+            "auto names the model it routed to"
+        );
+        let (_, headers, _) = post_full(
+            &st,
+            "sk-all",
+            json!({"model": "mid/untiered", "messages": []}),
+        )
+        .await;
+        assert_eq!(
+            headers["x-maitred-model"], "mid/untiered",
+            "a named model names itself"
+        );
     }
 
     #[tokio::test]
