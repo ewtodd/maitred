@@ -69,6 +69,11 @@ you what is being served and how to get yours, instead of a connection error:
   client that asked for `auto` can tell which one it got. `decision_log` records each decision as a JSON
   line. A Responses request with `previous_response_id` cannot be routed: the stored response lives on
   one server.
+
+  `router.extra` adds routed ids limited to some upstreams: `{"id": "fiona", "upstreams": ["eklow"]}` routes
+  the same way but only among the tiered models `eklow` serves, and is a 503 when none of them is up and
+  fits, never a model elsewhere. A conversation's remembered model is per routed id, `/v1/models` lists
+  each routable extra id after `auto`, and the decision log's `routed` field says which id was asked for.
 - **MCP gateway.** `/mcp` is one MCP endpoint (Streamable HTTP, JSON responses) in front of any number of
   stdio MCP servers:
   - each server is started on first use, kept running, and restarted if it exits;
@@ -121,6 +126,7 @@ hosted API, three keys, an MCP server and a passthrough.
 | `router.id` | The routed id (default `auto`), on when some model has a `tier`. Must not be a model id; keys name it like one. |
 | `router.move_below_tokens` | A conversation estimated below this (default 16384) may move to another model at a new user message; a longer one stays where it is cached. |
 | `router.forget_after_secs` | How long a quiet conversation's model is remembered (default 21600, six hours). |
+| `router.extra` | More routed ids, `[{id, upstreams}]`: an id routed like `router.id` but only among the tiered models of those upstreams, never falling back to others (e.g. `fiona` limited to `eklow`). Each must differ from every model id, `router.id` and the other extra ids; keys name them like any model id. |
 | `router.decision_log` | A file each routing decision is appended to, one JSON object per line. Under the NixOS module, put it in `/var/lib/maitred`. |
 | `router.log_prompts` | Also write the last user message's text into the decision log. Default false. |
 | `keys[].name`, `keys[].env` | The key's name (in logs and messages) and the variable holding its value. |
@@ -139,6 +145,7 @@ The config is checked at startup. maitred refuses to start on:
 - unknown upstreams;
 - duplicate model ids;
 - a router id that is also a model id;
+- an extra routed id that is also a model id, `router.id` or another extra id, that names an unknown upstream, or that has no upstreams;
 - `slots` of 0;
 - aliases or defaults outside the model's efforts;
 - key model lists naming unknown models;

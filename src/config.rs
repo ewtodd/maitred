@@ -170,6 +170,9 @@ pub struct Router {
     /// How long a quiet conversation's model is remembered.
     #[serde(default = "default_forget_after")]
     pub forget_after_secs: u64,
+    /// More routed ids, each limited to the tiered models of some upstreams.
+    #[serde(default)]
+    pub extra: Vec<ExtraRoute>,
     /// A file each routing decision is appended to, one JSON object per line.
     #[serde(default)]
     pub decision_log: Option<String>,
@@ -184,10 +187,20 @@ impl Default for Router {
             id: default_router_id(),
             move_below_tokens: default_move_below(),
             forget_after_secs: default_forget_after(),
+            extra: Vec::new(),
             decision_log: None,
             log_prompts: false,
         }
     }
+}
+
+/// An extra routed id: routed like `router.id`, but only among the tiered models served by `upstreams`. It never
+/// falls back to a model outside them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtraRoute {
+    pub id: String,
+    pub upstreams: Vec<String>,
 }
 
 fn default_router_id() -> String {
@@ -293,6 +306,26 @@ impl Config {
                 self.router.id
             ));
         }
+        let mut extra_ids = std::collections::HashSet::new();
+        for x in &self.router.extra {
+            if ids.contains(x.id.as_str()) {
+                return Err(format!("extra routed id {} is also a model id", x.id));
+            }
+            if x.id == self.router.id {
+                return Err(format!("extra routed id {} is also router.id", x.id));
+            }
+            if !extra_ids.insert(x.id.as_str()) {
+                return Err(format!("extra routed id {} listed twice", x.id));
+            }
+            if x.upstreams.is_empty() {
+                return Err(format!("extra routed id {}: no upstreams", x.id));
+            }
+            for u in &x.upstreams {
+                if !self.upstreams.contains_key(u) {
+                    return Err(format!("extra routed id {}: unknown upstream {u}", x.id));
+                }
+            }
+        }
         for (name, u) in &self.upstreams {
             if u.slots == Some(0) {
                 return Err(format!("upstream {name}: slots must be at least 1"));
@@ -307,7 +340,11 @@ impl Config {
         }
         for k in &self.keys {
             for m in &k.models {
-                if m != "*" && m != &self.router.id && !ids.contains(m.as_str()) {
+                if m != "*"
+                    && m != &self.router.id
+                    && !extra_ids.contains(m.as_str())
+                    && !ids.contains(m.as_str())
+                {
                     return Err(format!("key {}: unknown model {m}", k.name));
                 }
             }
@@ -350,6 +387,40 @@ mod tests {
         assert!(err.contains("also a model id"), "{err}");
         let err = routed("auto", 0).validate().unwrap_err();
         assert!(err.contains("slots"), "{err}");
+    }
+
+    #[test]
+    fn extra_routed_ids_are_checked() {
+        use serde_json::json;
+        let with = |extra: serde_json::Value| -> Result<(), String> {
+            let config: Config = serde_json::from_value(json!({
+                "listen": "127.0.0.1:0",
+                "router": {"extra": extra},
+                "upstreams": {"unholy": {"base_url": "http://a/v1"}, "eklow": {"base_url": "http://b/v1"}},
+                "models": [{"id": "unholy/ds4", "upstream": "unholy", "upstream_model": "ds4", "tier": 3}],
+                "keys": [{"name": "app", "env": "X", "models": ["fiona"]}]
+            }))
+            .unwrap();
+            config.validate()
+        };
+        with(json!([{"id": "fiona", "upstreams": ["eklow"]}])).unwrap();
+        let err = with(json!([{"id": "unholy/ds4", "upstreams": ["eklow"]}])).unwrap_err();
+        assert!(err.contains("also a model id"), "{err}");
+        let err = with(json!([{"id": "auto", "upstreams": ["eklow"]}])).unwrap_err();
+        assert!(err.contains("router.id"), "{err}");
+        let err = with(json!([
+            {"id": "fiona", "upstreams": ["eklow"]},
+            {"id": "fiona", "upstreams": ["unholy"]}
+        ]))
+        .unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+        let err = with(json!([{"id": "fiona", "upstreams": ["nowhere"]}])).unwrap_err();
+        assert!(err.contains("unknown upstream"), "{err}");
+        let err = with(json!([{"id": "fiona", "upstreams": []}])).unwrap_err();
+        assert!(err.contains("no upstreams"), "{err}");
+        // Without the extra id, the key's grant of it names an unknown model.
+        let err = with(json!([])).unwrap_err();
+        assert!(err.contains("unknown model fiona"), "{err}");
     }
 
     #[test]

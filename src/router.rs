@@ -1,4 +1,5 @@
-//! The routed id (`auto`): a request that leaves the model to maitred.
+//! The routed ids (`auto`, and any `router.extra`): a request that leaves the model to maitred. An extra id routes
+//! the same way among only the tiered models of some upstreams, and never falls back to others.
 //!
 //! Every model with a `tier` is a candidate while its server answers and the conversation fits its window (by a
 //! rough estimate, with a tenth kept spare). A conversation is recognised by its opening: the key, the
@@ -29,9 +30,51 @@ use std::time::{Duration, Instant};
 /// Tokens counted for an image (or other inline media), whatever its encoded size.
 const MEDIA_TOKENS: u64 = 1024;
 
-/// Whether `name` is the routed id and some model has a tier to route to.
-pub fn is_router(config: &Config, name: &str) -> bool {
-    name == config.router.id && config.models.iter().any(|m| m.tier.is_some())
+/// A routed id and the upstreams it is limited to: the main one (`router.id`) takes every tiered model, an extra
+/// one only those whose upstream it lists.
+#[derive(Debug, Clone, Copy)]
+pub struct Route<'a> {
+    pub id: &'a str,
+    upstreams: Option<&'a [String]>,
+}
+
+impl<'a> Route<'a> {
+    /// Whether `m` is one of this id's models: tiered, and on one of its upstreams.
+    pub fn admits(&self, m: &Model) -> bool {
+        m.tier.is_some() && self.upstreams.is_none_or(|u| u.contains(&m.upstream))
+    }
+
+    /// Its models, in config order.
+    pub fn models(&self, config: &'a Config) -> impl Iterator<Item = &'a Model> {
+        let route = *self;
+        config.models.iter().filter(move |m| route.admits(m))
+    }
+
+    /// Whether it is limited to some upstreams, and so never falls back to a model outside them.
+    pub fn limited(&self) -> bool {
+        self.upstreams.is_some()
+    }
+}
+
+/// Every routed id that has a tiered model to route to: `router.id` first, then the extra ids.
+pub fn routes(config: &Config) -> Vec<Route<'_>> {
+    let main = Route {
+        id: &config.router.id,
+        upstreams: None,
+    };
+    let extra = config.router.extra.iter().map(|x| Route {
+        id: &x.id,
+        upstreams: Some(&x.upstreams),
+    });
+    std::iter::once(main)
+        .chain(extra)
+        .filter(|r| r.models(config).next().is_some())
+        .collect()
+}
+
+/// The routed id `name` names, if it has a tiered model to route to.
+pub fn find<'a>(config: &'a Config, name: &str) -> Option<Route<'a>> {
+    routes(config).into_iter().find(|r| r.id == name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -161,10 +204,10 @@ impl Fnv {
     }
 }
 
-/// Requests in flight per upstream, and the model each recent conversation was sent to.
+/// Requests in flight per upstream, and the model each recent conversation was sent to, per routed id.
 pub struct Activity {
     in_flight: Mutex<HashMap<String, u32>>,
-    conversations: Mutex<HashMap<u64, (String, Instant)>>,
+    conversations: Mutex<HashMap<(String, u64), (String, Instant)>>,
     forget_after: Duration,
 }
 
@@ -200,17 +243,21 @@ impl Activity {
             .unwrap_or(0)
     }
 
-    /// The model `conversation` was last sent to, unless it has been quiet for longer than `forget_after`.
-    fn last_model(&self, conversation: u64) -> Option<String> {
+    /// The model `conversation` was last sent to by the routed id `routed`, unless it has been quiet for longer
+    /// than `forget_after`.
+    fn last_model(&self, routed: &str, conversation: u64) -> Option<String> {
         let conversations = self.conversations.lock().unwrap();
-        let (model, at) = conversations.get(&conversation)?;
+        let (model, at) = conversations.get(&(routed.to_string(), conversation))?;
         (at.elapsed() < self.forget_after).then(|| model.clone())
     }
 
-    fn record(&self, conversation: u64, model: &str) {
+    fn record(&self, routed: &str, conversation: u64, model: &str) {
         let mut conversations = self.conversations.lock().unwrap();
         conversations.retain(|_, (_, at)| at.elapsed() < self.forget_after);
-        conversations.insert(conversation, (model.to_string(), Instant::now()));
+        conversations.insert(
+            (routed.to_string(), conversation),
+            (model.to_string(), Instant::now()),
+        );
     }
 }
 
@@ -326,6 +373,8 @@ fn fits(m: &Model, tokens: u64) -> bool {
 
 /// A routed request's model, and why.
 pub struct Decision<'a> {
+    /// The routed id that was asked for.
+    pub routed: &'a str,
     pub model: &'a Model,
     pub reason: Reason,
     pub previous: Option<String>,
@@ -336,6 +385,7 @@ pub struct Decision<'a> {
 }
 
 /// Why no model could be picked.
+#[derive(Debug)]
 pub enum NoRoute {
     /// Nothing that fits the conversation is serving (503).
     Unavailable(Unavailable),
@@ -343,19 +393,19 @@ pub enum NoRoute {
     TooLong(String),
 }
 
-/// Pick the model for a request to the routed id, given which upstreams answer (`up`), and remember it for the
+/// Pick the model for a request to `route`, given which upstreams answer (`up`), and remember it for the
 /// conversation.
 pub fn route<'a>(
     config: &'a Config,
+    route: Route<'a>,
     up: &HashMap<String, bool>,
     activity: &Activity,
     shape: &Shape,
 ) -> Result<Decision<'a>, NoRoute> {
     let is_up = |u: &str| up.get(u).copied().unwrap_or(false);
-    let fitting: Vec<&Model> = config
-        .models
-        .iter()
-        .filter(|m| m.tier.is_some() && fits(m, shape.tokens))
+    let fitting: Vec<&Model> = route
+        .models(config)
+        .filter(|m| fits(m, shape.tokens))
         .collect();
     let candidates: Vec<Candidate> = fitting
         .iter()
@@ -371,7 +421,9 @@ pub fn route<'a>(
         })
         .collect();
     let ideal = fitting.iter().copied().min_by_key(|m| Reverse(m.tier));
-    let previous = shape.conversation.and_then(|c| activity.last_model(c));
+    let previous = shape
+        .conversation
+        .and_then(|c| activity.last_model(route.id, c));
     let Some((model, reason)) = choose(
         &candidates,
         previous.as_deref(),
@@ -379,12 +431,13 @@ pub fn route<'a>(
         shape.tokens,
         config.router.move_below_tokens,
     ) else {
-        return Err(no_route(config, up, shape.tokens, ideal));
+        return Err(no_route(config, route, up, shape.tokens, ideal));
     };
     if let Some(c) = shape.conversation {
-        activity.record(c, &model.id);
+        activity.record(route.id, c, &model.id);
     }
     Ok(Decision {
+        routed: route.id,
         model,
         reason,
         previous,
@@ -395,33 +448,36 @@ pub fn route<'a>(
 
 fn no_route(
     config: &Config,
+    route: Route,
     up: &HashMap<String, bool>,
     tokens: u64,
     ideal: Option<&Model>,
 ) -> NoRoute {
-    let id = &config.router.id;
+    let id = route.id;
+    let only = if route.limited() {
+        format!(" {id} routes only to its own upstreams and never falls back to other models.")
+    } else {
+        String::new()
+    };
     let Some(ideal) = ideal else {
-        let largest = config
-            .models
-            .iter()
-            .filter(|m| m.tier.is_some())
+        let largest = route
+            .models(config)
             .filter_map(|m| m.context_length)
             .max()
             .unwrap_or(0);
         return NoRoute::TooLong(format!(
             "This conversation (about {tokens} tokens) is too long for every model {id} routes to: the largest \
-             window is {largest} tokens, a tenth of it kept for the answer."
+             window is {largest} tokens, a tenth of it kept for the answer.{only}"
         ));
     };
-    let serving = config
-        .models
-        .iter()
-        .any(|m| m.tier.is_some() && up.get(&m.upstream).copied().unwrap_or(false));
+    let serving = route
+        .models(config)
+        .any(|m| up.get(&m.upstream).copied().unwrap_or(false));
     if !serving {
         return NoRoute::Unavailable(Unavailable {
             message: format!(
                 "{id} has nothing to serve: none of its models is answering right now (they may be switching \
-                 or restarting). Try again in a few minutes."
+                 or restarting). Try again in a few minutes.{only}"
             ),
             retry_after: Some(120),
         });
@@ -437,7 +493,7 @@ fn no_route(
     NoRoute::Unavailable(Unavailable {
         message: format!(
             "This conversation (about {tokens} tokens) is too long for the models {id} has serving right now. \
-             {} ({}) would take it but is not serving; {then}.",
+             {} ({}) would take it but is not serving; {then}.{only}",
             ideal.display(),
             ideal.id
         ),
@@ -468,6 +524,7 @@ impl DecisionLog {
         let mut line = json!({
             "ts": chrono::Utc::now().to_rfc3339(),
             "key": key,
+            "routed": d.routed,
             "conversation": shape.conversation.map(|c| format!("{c:016x}")),
             "turn": shape.turn.as_str(),
             "tokens": shape.tokens,
@@ -658,9 +715,95 @@ mod tests {
         assert_eq!(a.in_flight("up"), 1);
         drop(g2);
         assert_eq!(a.in_flight("up"), 0);
-        a.record(7, "m");
-        assert_eq!(a.last_model(7).as_deref(), Some("m"));
+        a.record("auto", 7, "m");
+        assert_eq!(a.last_model("auto", 7).as_deref(), Some("m"));
+        assert_eq!(a.last_model("fiona", 7), None, "per routed id");
         std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(a.last_model(7), None);
+        assert_eq!(a.last_model("auto", 7), None);
+    }
+
+    fn two_upstreams() -> Config {
+        serde_json::from_value(json!({
+            "listen": "127.0.0.1:0",
+            "upstreams": {"other": {"base_url": "http://a/v1"}, "eklow": {"base_url": "http://b/v1"}},
+            "models": [
+                {"id": "other/strong", "upstream": "other", "upstream_model": "s", "tier": 3},
+                {"id": "eklow/weak", "upstream": "eklow", "upstream_model": "w", "tier": 2}
+            ],
+            "router": {"extra": [{"id": "fiona", "upstreams": ["eklow"]}]},
+            "keys": []
+        }))
+        .unwrap()
+    }
+
+    fn up_map(other: bool, eklow: bool) -> HashMap<String, bool> {
+        HashMap::from([("other".to_string(), other), ("eklow".to_string(), eklow)])
+    }
+
+    fn opening() -> Shape {
+        shape(
+            "k",
+            &json!({"messages": [{"role": "user", "content": "hi"}]}),
+        )
+    }
+
+    #[test]
+    fn an_extra_id_routes_only_among_its_upstreams() {
+        let config = two_upstreams();
+        let activity = Activity::new(Duration::from_secs(60));
+        let both = up_map(true, true);
+        let fiona = find(&config, "fiona").unwrap();
+        let auto = find(&config, "auto").unwrap();
+        let d = route(&config, fiona, &both, &activity, &opening())
+            .ok()
+            .unwrap();
+        assert_eq!((d.model.id.as_str(), d.routed), ("eklow/weak", "fiona"));
+        assert_eq!(d.candidates, ["eklow/weak"]);
+        let d = route(
+            &config,
+            auto,
+            &both,
+            &activity,
+            &shape(
+                "k2",
+                &json!({"messages": [{"role": "user", "content": "hi"}]}),
+            ),
+        )
+        .unwrap();
+        assert_eq!((d.model.id.as_str(), d.routed), ("other/strong", "auto"));
+
+        // eklow down: no route for fiona, though `other` is up.
+        let r = route(
+            &config,
+            fiona,
+            &up_map(true, false),
+            &activity,
+            &shape(
+                "k3",
+                &json!({"messages": [{"role": "user", "content": "hi"}]}),
+            ),
+        );
+        assert!(matches!(r, Err(NoRoute::Unavailable(_))));
+    }
+
+    #[test]
+    fn a_conversation_is_remembered_per_routed_id() {
+        let mut config = two_upstreams();
+        // Both ids may reach both models, so only the memory keeps them apart.
+        config.router.extra[0].upstreams = vec!["other".to_string(), "eklow".to_string()];
+        let activity = Activity::new(Duration::from_secs(60));
+        let both = up_map(true, true);
+        let s = opening();
+        let auto = find(&config, "auto").unwrap();
+        let fiona = find(&config, "fiona").unwrap();
+        // Auto sends a long conversation to the strong model and remembers it there.
+        let d = route(&config, auto, &both, &activity, &s).unwrap();
+        assert_eq!(d.model.id, "other/strong");
+        // Fiona has not seen the conversation: it is new to her, not a continuation of auto's.
+        let d = route(&config, fiona, &both, &activity, &s).unwrap();
+        assert_eq!((d.previous, d.reason), (None, Reason::New));
+        // Auto still remembers its own.
+        let d = route(&config, auto, &both, &activity, &s).unwrap();
+        assert_eq!(d.previous.as_deref(), Some("other/strong"));
     }
 }

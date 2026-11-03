@@ -204,11 +204,11 @@ fn model_entry(config: &Config, m: &Model, up: &HashMap<String, bool>) -> Value 
     e
 }
 
-/// The `/v1/models` entry for the routed id. Its window is the largest among the routed models serving now (the
+/// The `/v1/models` entry for a routed id. Its window is the largest among the routed models serving now (the
 /// router keeps a conversation off a model it has outgrown), its efforts are every level one of them takes (each
 /// request is translated for the model it lands on), and `routes_to` lists its models, strongest first.
-fn router_entry(config: &Config, up: &HashMap<String, bool>) -> Value {
-    let mut routed: Vec<&Model> = config.models.iter().filter(|m| m.tier.is_some()).collect();
+fn router_entry(config: &Config, route: router::Route, up: &HashMap<String, bool>) -> Value {
+    let mut routed: Vec<&Model> = route.models(config).collect();
     routed.sort_by_key(|m| std::cmp::Reverse(m.tier));
     let serving: Vec<&Model> = routed
         .iter()
@@ -221,7 +221,7 @@ fn router_entry(config: &Config, up: &HashMap<String, bool>) -> Value {
         &serving
     };
     let mut e = json!({
-        "id": config.router.id,
+        "id": route.id,
         "object": "model",
         "created": 0,
         "owned_by": "maitred",
@@ -248,7 +248,7 @@ fn router_entry(config: &Config, up: &HashMap<String, bool>) -> Value {
         e["status"] = json!("unavailable");
         e["status_reason"] = json!(format!(
             "None of the models {} routes to is answering right now.",
-            config.router.id
+            route.id
         ));
     } else {
         e["status"] = json!("serving");
@@ -262,10 +262,10 @@ pub async fn models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     let key = st.keys.identify(&headers).ok();
     let up = st.probes.snapshot(&st.config).await;
     let mut data: Vec<Value> = Vec::new();
-    if router::is_router(&st.config, &st.config.router.id)
-        && key.is_none_or(|k| auth::may_use(k, &st.config.router.id))
-    {
-        data.push(router_entry(&st.config, &up));
+    for route in router::routes(&st.config) {
+        if key.is_none_or(|k| auth::may_use(k, route.id)) {
+            data.push(router_entry(&st.config, route, &up));
+        }
     }
     data.extend(
         st.config
@@ -280,9 +280,9 @@ pub async fn models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Resp
 
 /// `GET /v1/models/{id}`.
 pub async fn model(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    if router::is_router(&st.config, &id) {
+    if let Some(route) = router::find(&st.config, &id) {
         let up = st.probes.snapshot(&st.config).await;
-        return Json(router_entry(&st.config, &up)).into_response();
+        return Json(router_entry(&st.config, route, &up)).into_response();
     }
     let Some(m) = resolve(&st.config, &id) else {
         return error(
@@ -298,8 +298,8 @@ pub async fn model(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> R
 
 /// What a request's `model` names.
 enum Target<'a> {
-    /// The routed id: maitred picks the model, from what the body looks like.
-    Routed(router::Shape),
+    /// A routed id: maitred picks the model, from what the body looks like.
+    Routed(router::Route<'a>, router::Shape),
     Named(&'a Model),
 }
 
@@ -310,9 +310,9 @@ async fn pick<'a>(
 ) -> Result<(&'a Model, Option<router::Decision<'a>>), NoRoute> {
     match target {
         Target::Named(m) => Ok((*m, None)),
-        Target::Routed(shape) => {
+        Target::Routed(route, shape) => {
             let up = st.probes.snapshot(&st.config).await;
-            router::route(&st.config, &up, &st.activity, shape).map(|d| (d.model, Some(d)))
+            router::route(&st.config, *route, &up, &st.activity, shape).map(|d| (d.model, Some(d)))
         }
     }
 }
@@ -326,9 +326,11 @@ fn unknown_model(config: &Config, key: &Key, name: &str) -> Response {
         .filter(|m| auth::may_use(key, &m.id))
         .map(|m| m.id.as_str())
         .collect();
-    if router::is_router(config, &config.router.id) && auth::may_use(key, &config.router.id) {
-        ids.insert(0, &config.router.id);
-    }
+    let routed = router::routes(config)
+        .into_iter()
+        .filter(|r| auth::may_use(key, r.id))
+        .map(|r| r.id);
+    ids.splice(0..0, routed);
     error(
         StatusCode::NOT_FOUND,
         "invalid_request_error",
@@ -370,7 +372,7 @@ pub async fn v1(
         );
     };
     // The routed id is resolved per request, never as a fallback for a named model.
-    let target = if router::is_router(&st.config, &name) {
+    let target = if let Some(route) = router::find(&st.config, &name) {
         if req
             .get("previous_response_id")
             .is_some_and(|v| !v.is_null())
@@ -385,7 +387,7 @@ pub async fn v1(
                 ),
             );
         }
-        Target::Routed(router::shape(&key.name, &req))
+        Target::Routed(route, router::shape(&key.name, &req))
     } else {
         match resolve(&st.config, &name) {
             Some(m) => Target::Named(m),
@@ -395,7 +397,7 @@ pub async fn v1(
     // A key is granted the id it asked for: the routed id itself, not whatever it routes to now.
     let granted = match &target {
         Target::Named(m) => m.id.as_str(),
-        Target::Routed(_) => name.as_str(),
+        Target::Routed(..) => name.as_str(),
     };
     if !auth::may_use(key, granted) {
         let allowed = st
@@ -416,7 +418,7 @@ pub async fn v1(
     }
 
     // A routed request whose server turns out not to answer (its probe was stale) is routed once more.
-    let attempts = if matches!(target, Target::Routed(_)) {
+    let attempts = if matches!(target, Target::Routed(..)) {
         2
     } else {
         1
@@ -439,7 +441,8 @@ pub async fn v1(
                 );
             }
         };
-        if let (Some(log), Some(d), Target::Routed(shape)) = (&st.decisions, &decision, &target) {
+        if let (Some(log), Some(d), Target::Routed(_, shape)) = (&st.decisions, &decision, &target)
+        {
             log.write(&key.name, shape, d);
         }
         // The client's body is kept for another attempt, and taken on the last.
@@ -1040,5 +1043,126 @@ mod tests {
             e["status_reason"].as_str().unwrap().contains("Qwen")
                 || e["status_reason"].as_str().unwrap().contains("qwen3.8-27b")
         );
+    }
+
+    /// `other/strong` (tier 3) and `eklow/weak` (tier 2), each on its own upstream (`eklow` is the given base
+    /// url), with `fiona` routed only to `eklow`; a key granted only `fiona`, one granted only `auto`, one all.
+    async fn extra_state(eklow: String) -> Arc<AppState> {
+        let other = echo_upstream().await;
+        let config: Config = serde_json::from_value(json!({
+            "listen": "127.0.0.1:0",
+            "upstreams": {"other": {"base_url": other}, "eklow": {"base_url": eklow}},
+            "models": [
+                {"id": "other/strong", "upstream": "other", "upstream_model": "strong", "tier": 3},
+                {"id": "eklow/weak", "upstream": "eklow", "upstream_model": "weak", "tier": 2}
+            ],
+            "router": {"extra": [{"id": "fiona", "upstreams": ["eklow"]}]},
+            "keys": [
+                {"name": "fiona", "env": "UNUSED", "models": ["fiona"]},
+                {"name": "app", "env": "UNUSED", "models": ["auto"]},
+                {"name": "all", "env": "UNUSED"}
+            ]
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        let keys = config.keys.clone();
+        let mut st = AppState::new(config).unwrap();
+        st.keys = Keys::new(
+            ["sk-fiona", "sk-app", "sk-all"]
+                .iter()
+                .zip(keys)
+                .map(|(s, k)| (s.to_string(), k))
+                .collect(),
+        );
+        Arc::new(st)
+    }
+
+    fn ask(model: &str) -> Value {
+        json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    #[tokio::test]
+    async fn an_extra_routed_id_serves_only_its_upstreams() {
+        let st = extra_state(echo_upstream().await).await;
+        let (status, headers, body) = post_full(&st, "sk-all", ask("fiona")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(headers["x-maitred-model"], "eklow/weak");
+        let (_, headers, _) = post_full(&st, "sk-all", ask("auto")).await;
+        assert_eq!(headers["x-maitred-model"], "other/strong");
+
+        // With eklow down, fiona does not borrow `other`; auto still serves.
+        let st = extra_state("http://127.0.0.1:1/v1".to_string()).await;
+        let (status, err) = post(&st, "sk-all", ask("fiona")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{err}");
+        assert_eq!(err["error"]["code"], "model_not_loaded");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("never falls back"),
+            "{err}"
+        );
+        let (status, _, _) = post_full(&st, "sk-all", ask("auto")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_key_is_granted_an_extra_id_by_its_id() {
+        let st = extra_state(echo_upstream().await).await;
+        let (status, _, body) = post_full(&st, "sk-fiona", ask("fiona")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _) = post(&st, "sk-fiona", ask("auto")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = post(&st, "sk-app", ask("fiona")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_listing_has_each_routable_extra_id_after_the_main_one() {
+        let ids = |st: Arc<AppState>, headers: HeaderMap| async move {
+            let resp = models(State(st), headers).await;
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let listing: Value = serde_json::from_slice(&bytes).unwrap();
+            listing["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| (e["id"].as_str().unwrap().to_string(), e.clone()))
+                .collect::<Vec<_>>()
+        };
+        let st = extra_state(echo_upstream().await).await;
+        let listed = ids(st.clone(), HeaderMap::new()).await;
+        let names: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(&names[..2], ["auto", "fiona"]);
+        assert_eq!(listed[1].1["routes_to"], json!(["eklow/weak"]));
+
+        // A key sees only the routed ids it is granted.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer sk-fiona".parse().unwrap());
+        let listed = ids(st, headers).await;
+        assert_eq!(listed[0].0, "fiona");
+        assert!(listed.iter().all(|(id, _)| id != "auto"));
+
+        // No tiered model on its upstreams: not routable, not listed.
+        let config: Config = serde_json::from_value(json!({
+            "listen": "127.0.0.1:0",
+            "upstreams": {"other": {"base_url": "http://127.0.0.1:1/v1"}, "eklow": {"base_url": "http://127.0.0.1:1/v1"}},
+            "models": [
+                {"id": "other/strong", "upstream": "other", "upstream_model": "strong", "tier": 3},
+                {"id": "eklow/plain", "upstream": "eklow", "upstream_model": "plain"}
+            ],
+            "router": {"extra": [{"id": "fiona", "upstreams": ["eklow"]}]},
+            "keys": []
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        let st = Arc::new(AppState::new(config).unwrap());
+        let listed = ids(st.clone(), HeaderMap::new()).await;
+        assert!(listed.iter().any(|(id, _)| id == "auto"));
+        assert!(listed.iter().all(|(id, _)| id != "fiona"));
+        let (status, err) = post(&st, "x", ask("fiona")).await;
+        assert_ne!(status, StatusCode::OK, "{err}");
     }
 }
