@@ -121,7 +121,7 @@ hosted API, three keys, an MCP server and a passthrough.
 | `models[].effort_aliases` | Explicit rewrites applied before clamping, e.g. `{"medium": "high"}`. |
 | `models[].extra` | Extra fields merged into the model's `/v1/models` entry. |
 | `models[].request_overrides` | Top-level fields set on every request for the model, replacing what the client sent. For example, a `response_format` that forces JSON; two ids can then serve one upstream model with different settings. |
-| `modes[]` | `name`, `label` (used in messages), `host` (modes on one host exclude each other), `upstreams`. |
+| `modes[]` | `name`, `label` (used in messages), `host` (modes on one host exclude each other), `upstreams` (two modes may share one, such as a card server that stays up beside either of two others). |
 | `switch_hint` | What an unavailable-model error suggests about the mode; `{mode}` becomes the wanted mode's label. Default `ask the admin to switch to {mode}`. |
 | `router.id` | The routed id (default `auto`), on when some model has a `tier`. Must not be a model id; keys name it like one. |
 | `router.move_below_tokens` | A conversation estimated below this (default 16384) may move to another model at a new user message; a longer one stays where it is cached. |

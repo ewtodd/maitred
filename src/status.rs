@@ -92,7 +92,15 @@ pub fn explain(config: &Config, model: &Model, up: &HashMap<String, bool>) -> Un
         };
     };
     let host = &wanted.host;
-    if wanted.upstreams.iter().any(|u| is_up(u)) {
+    // Modes can share an upstream (one card server beside either of two others): what is up only means
+    // the wanted mode is loading while no other mode on the host has an upstream of its own up.
+    let rival_up = config
+        .modes
+        .iter()
+        .filter(|m| m.name != wanted.name && m.host == wanted.host)
+        .flat_map(|m| &m.upstreams)
+        .any(|u| is_up(u) && !wanted.upstreams.contains(u));
+    if !rival_up && wanted.upstreams.iter().any(|u| is_up(u)) {
         return Unavailable {
             message: format!(
                 "{} ({}) is still loading on {host} (it was just switched or restarted); try again in a minute or two.",
@@ -121,7 +129,11 @@ pub fn explain(config: &Config, model: &Model, up: &HashMap<String, bool>) -> Un
             retry_after: Some(120),
         };
     }
-    let other = serving[0];
+    // With a shared upstream a mode that is not loaded looks half up; the mode that is loaded is all up.
+    let other = serving
+        .iter()
+        .find(|m| m.upstreams.iter().all(|u| is_up(u)))
+        .unwrap_or(&serving[0]);
     let instead: Vec<String> = config
         .models
         .iter()
@@ -184,6 +196,33 @@ mod tests {
         list.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
+    /// `config()` with a third mode that shares radiance with the Qwen pair.
+    fn shared_config() -> Config {
+        serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1:0",
+            "switch_hint": "ask the admin to switch son-of-anton to {mode}",
+            "upstreams": {
+                "unholy": {"base_url": "http://a/v1"},
+                "radiance": {"base_url": "http://b/v1"},
+                "gufo": {"base_url": "http://c/v1"},
+                "fork": {"base_url": "http://d/v1"}
+            },
+            "modes": [
+                {"name": "ds4", "label": "DeepSeek-V4-Flash", "host": "son-of-anton", "upstreams": ["unholy"]},
+                {"name": "qwen", "label": "the Qwen models", "host": "son-of-anton", "upstreams": ["radiance", "gufo"]},
+                {"name": "dual", "label": "V4.1 and the 27B", "host": "son-of-anton", "upstreams": ["radiance", "fork"]}
+            ],
+            "models": [
+                {"id": "unholy/dsv4-flash", "upstream": "unholy", "upstream_model": "dsv4-flash", "display_name": "DeepSeek-V4-Flash"},
+                {"id": "radiance/qwen3.8-27b", "upstream": "radiance", "upstream_model": "qwen3.8-27b", "display_name": "Qwen3.8-27B"},
+                {"id": "gufo/qwen3.8-flash-next", "upstream": "gufo", "upstream_model": "qwen3.8-flash-next", "display_name": "Qwen3.8-Flash-Next"},
+                {"id": "fork/deepseek-v4.1-flash", "upstream": "fork", "upstream_model": "deepseek-v4.1-flash", "display_name": "DeepSeek-V4.1-Flash"}
+            ],
+            "keys": []
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn other_mode_serving_suggests_its_models_and_a_switch() {
         let c = config();
@@ -220,6 +259,84 @@ mod tests {
         );
         assert!(u.message.contains("still loading"));
         assert_eq!(u.retry_after, Some(60));
+    }
+
+    #[test]
+    fn a_shared_upstream_does_not_make_the_mode_that_is_not_loaded_look_like_it_is_loading() {
+        let c = shared_config();
+        // llm-mode dual: Flash-Next's mode has radiance up, but the fork says dual is what is loaded.
+        let u = explain(
+            &c,
+            &c.models[2],
+            &up(&[
+                ("unholy", false),
+                ("radiance", true),
+                ("gufo", false),
+                ("fork", true),
+            ]),
+        );
+        assert_eq!(
+            u.message,
+            "Qwen3.8-Flash-Next (gufo/qwen3.8-flash-next) is not loaded: son-of-anton is serving V4.1 and the 27B right now. \
+             Use Qwen3.8-27B (radiance/qwen3.8-27b) or DeepSeek-V4.1-Flash (fork/deepseek-v4.1-flash) instead, or ask the \
+             admin to switch son-of-anton to the Qwen models."
+        );
+        assert_eq!(u.retry_after, None);
+        // And the other way round.
+        let u = explain(
+            &c,
+            &c.models[3],
+            &up(&[
+                ("unholy", false),
+                ("radiance", true),
+                ("gufo", true),
+                ("fork", false),
+            ]),
+        );
+        assert!(
+            u.message
+                .contains("is not loaded: son-of-anton is serving the Qwen models right now.")
+        );
+        assert!(
+            u.message
+                .ends_with("ask the admin to switch son-of-anton to V4.1 and the 27B.")
+        );
+    }
+
+    #[test]
+    fn the_mode_named_as_serving_is_the_one_that_is_all_up() {
+        let c = shared_config();
+        // The Qwen pair comes first and has radiance up; dual is what is loaded.
+        let u = explain(
+            &c,
+            &c.models[0],
+            &up(&[
+                ("unholy", false),
+                ("radiance", true),
+                ("gufo", false),
+                ("fork", true),
+            ]),
+        );
+        assert!(u.message.contains("serving V4.1 and the 27B right now"));
+    }
+
+    #[test]
+    fn a_shared_upstream_alone_still_says_wait() {
+        let c = shared_config();
+        // Radiance up and neither gufo yet: either mode may be on its way.
+        for model in &c.models[2..4] {
+            let u = explain(
+                &c,
+                model,
+                &up(&[
+                    ("unholy", false),
+                    ("radiance", true),
+                    ("gufo", false),
+                    ("fork", false),
+                ]),
+            );
+            assert!(u.message.contains("still loading"), "{}", u.message);
+        }
     }
 
     #[tokio::test]
