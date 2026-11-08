@@ -10,6 +10,7 @@ mod config;
 mod effort;
 mod mcp;
 mod proxy;
+mod requests;
 mod router;
 mod status;
 
@@ -56,6 +57,7 @@ async fn main() {
     });
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/status", get(proxy::status_page))
         .route("/mcp", post(mcp::post).get(mcp::other).delete(mcp::other))
         .route("/v1/models", get(proxy::models))
         .route("/v1/models/{*id}", get(proxy::model))

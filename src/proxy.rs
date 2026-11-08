@@ -4,6 +4,7 @@ use crate::auth::{self, Denied, Keys};
 use crate::config::{Config, Key, Model, Passthrough};
 use crate::effort;
 use crate::mcp::Mcp;
+use crate::requests::{Rec, RequestLog};
 use crate::router::{self, Activity, DecisionLog, InFlight, NoRoute};
 use crate::status::{self, Probes, Unavailable};
 use axum::Json;
@@ -24,6 +25,7 @@ pub struct AppState {
     pub probes: Probes,
     pub mcp: Mcp,
     pub activity: Arc<Activity>,
+    pub log: Arc<RequestLog>,
     decisions: Option<DecisionLog>,
     clients: HashMap<String, reqwest::Client>,
     upstream_keys: HashMap<String, String>,
@@ -34,7 +36,7 @@ impl AppState {
     pub fn new(config: Config) -> Result<AppState, String> {
         let mut clients = HashMap::new();
         let mut upstream_keys = HashMap::new();
-        for (name, u) in &config.upstreams {
+        for (name, u) in config.upstreams.iter() {
             let client = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(u.connect_timeout_secs))
                 .timeout(Duration::from_secs(u.timeout_secs))
@@ -73,6 +75,7 @@ impl AppState {
             probes: Probes::new(probe_keys),
             mcp,
             activity,
+            log: RequestLog::new(),
             decisions,
             clients,
             upstream_keys,
@@ -84,8 +87,14 @@ impl AppState {
 pub fn error(status: StatusCode, kind: &str, code: &str, message: impl Into<String>) -> Response {
     let body =
         json!({"error": {"message": message.into(), "type": kind, "code": code, "param": null}});
-    (status, Json(body)).into_response()
+    let mut r = (status, Json(body)).into_response();
+    r.extensions_mut().insert(ErrorCode(code.to_string()));
+    r
 }
+
+/// The `code` of an error answer, carried on the response (never sent) for the request log.
+#[derive(Clone)]
+struct ErrorCode(String);
 
 fn with_retry_after(mut r: Response, secs: u64) -> Response {
     r.headers_mut()
@@ -296,6 +305,66 @@ pub async fn model(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> R
     Json(model_entry(&st.config, m, &up)).into_response()
 }
 
+/// `GET /status`: what llmtop shows. Upstream verdicts come from the probe snapshot `/v1/models` uses; the
+/// requests and key counters from the request log. Unauthenticated: the WAN proxy does not forward it.
+pub async fn status_page(State(st): State<Arc<AppState>>) -> Response {
+    let up = st.probes.snapshot(&st.config).await;
+    let config = &st.config;
+    let upstreams: Vec<Value> = config
+        .upstreams
+        .names()
+        .iter()
+        .map(|name| {
+            let u = &config.upstreams[name];
+            let serving = up.get(name).copied().unwrap_or(false);
+            json!({
+                "name": name,
+                "base_url": u.base_url,
+                "host": config.modes.iter().find(|m| m.upstreams.contains(name)).map(|m| &m.host),
+                "hosted": u.api_key_env.is_some(),
+                "serving": serving,
+                "reason": if serving { String::new() } else { format!("{}/models did not answer", u.base_url.trim_end_matches('/')) },
+                "in_flight": st.activity.in_flight(name),
+                "slots": u.slots,
+                "models": config.models.iter().filter(|m| &m.upstream == name).map(|m| json!({
+                    "id": m.id,
+                    "display_name": m.display(),
+                    "hidden": m.hidden,
+                    "tier": m.tier,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let modes: Vec<Value> = config
+        .modes
+        .iter()
+        .map(|m| {
+            json!({
+                "name": m.name,
+                "label": m.label,
+                "host": m.host,
+                "upstreams": m.upstreams,
+                "serving": m.upstreams.iter().all(|u| up.get(u).copied().unwrap_or(false)),
+            })
+        })
+        .collect();
+    let key_names: Vec<&str> = config.keys.iter().map(|k| k.name.as_str()).collect();
+    let (recent, keys) = st.log.snapshot(&key_names);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    Json(json!({
+        "version": 1,
+        "now": now,
+        "started": st.log.started(),
+        "upstreams": upstreams,
+        "modes": modes,
+        "keys": keys,
+        "recent": recent,
+    }))
+    .into_response()
+}
+
 /// What a request's `model` names.
 enum Target<'a> {
     /// A routed id: maitred picks the model, from what the body looks like.
@@ -352,6 +421,28 @@ pub async fn v1(
         Ok(k) => k,
         Err(d) => return denied(d),
     };
+    // Recorded from here on. A relayed answer takes the record over; any other is maitred's own error answer.
+    let mut rec = Some(st.log.begin(&key.name, &rest, started));
+    let resp = serve(&st, &rest, &headers, body, key, started, &mut rec).await;
+    if let Some(mut r) = rec {
+        let code = resp
+            .extensions()
+            .get::<ErrorCode>()
+            .map_or("error", |c| c.0.as_str());
+        r.rejected(resp.status().as_u16(), code);
+    }
+    resp
+}
+
+async fn serve(
+    st: &AppState,
+    rest: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    key: &Key,
+    started: Instant,
+    rec: &mut Option<Rec>,
+) -> Response {
     let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -371,6 +462,9 @@ pub async fn v1(
             "The request names no model.",
         );
     };
+    if let Some(r) = rec.as_ref() {
+        r.requested(&name);
+    }
     // The routed id is resolved per request, never as a fallback for a named model.
     let target = if let Some(route) = router::find(&st.config, &name) {
         if req
@@ -425,7 +519,7 @@ pub async fn v1(
     };
     let mut attempt = 1;
     loop {
-        let (model, decision) = match pick(&st, &target).await {
+        let (model, decision) = match pick(st, &target).await {
             Ok(picked) => picked,
             Err(NoRoute::Unavailable(u)) => {
                 tracing::info!(key = %key.name, model = %name, path = %rest, status = 503, ms = started.elapsed().as_millis() as u64, "unavailable: {}", u.message);
@@ -441,6 +535,10 @@ pub async fn v1(
                 );
             }
         };
+        if let Some(r) = rec.as_ref() {
+            let route = decision.as_ref().map_or("", |d| d.reason.as_str());
+            r.picked(&model.id, &model.upstream, route);
+        }
         if let (Some(log), Some(d), Target::Routed(_, shape)) = (&st.decisions, &decision, &target)
         {
             log.write(&key.name, shape, d);
@@ -512,6 +610,9 @@ pub async fn v1(
                 );
             }
         };
+        if let Some(r) = rec.as_ref() {
+            r.headers(resp.status().as_u16());
+        }
         tracing::info!(
             key = %key.name,
             model = %model.id,
@@ -527,6 +628,7 @@ pub async fn v1(
             resp,
             Duration::from_secs(upstream.idle_timeout_secs),
             Some(in_flight),
+            rec.take(),
         );
         // Name the model that answered: for the routed id, the one it picked.
         if let Ok(id) = HeaderValue::from_str(&model.id) {
@@ -573,7 +675,7 @@ async fn passthrough(st: &AppState, p: &Passthrough, req: Request) -> Response {
     }
     out = out.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     match out.send().await {
-        Ok(resp) => relay(resp, Duration::from_secs(p.timeout_secs), None),
+        Ok(resp) => relay(resp, Duration::from_secs(p.timeout_secs), None, None),
         Err(e) => error(
             StatusCode::BAD_GATEWAY,
             "upstream_error",
@@ -600,27 +702,51 @@ fn hop_by_hop(name: &HeaderName) -> bool {
 
 /// Stream an upstream response back as it arrives, ending it if the upstream goes quiet for `idle`. The request
 /// stays counted in flight until the stream ends or the client goes away.
-fn relay(resp: reqwest::Response, idle: Duration, in_flight: Option<InFlight>) -> Response {
+fn relay(
+    resp: reqwest::Response,
+    idle: Duration,
+    in_flight: Option<InFlight>,
+    rec: Option<Rec>,
+) -> Response {
     let mut builder = Response::builder().status(resp.status());
     for (k, v) in resp.headers() {
         if !hop_by_hop(k) {
             builder = builder.header(k, v);
         }
     }
-    let start = Some((resp.bytes_stream(), in_flight));
+    let start = Some((resp.bytes_stream(), in_flight, rec));
     let stream = futures_util::stream::unfold(start, move |state| async move {
-        let (mut s, in_flight) = state?;
+        let (mut s, in_flight, mut rec) = state?;
         match tokio::time::timeout(idle, s.next()).await {
-            Ok(Some(Ok(chunk))) => Some((Ok::<Bytes, std::io::Error>(chunk), Some((s, in_flight)))),
-            Ok(Some(Err(e))) => Some((Err(std::io::Error::other(e)), None)),
-            Ok(None) => None,
-            Err(_) => Some((
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "upstream went quiet",
-                )),
-                None,
-            )),
+            Ok(Some(Ok(chunk))) => {
+                if let Some(r) = rec.as_mut() {
+                    r.chunk(&chunk);
+                }
+                Some((
+                    Ok::<Bytes, std::io::Error>(chunk),
+                    Some((s, in_flight, rec)),
+                ))
+            }
+            Ok(Some(Err(e))) => {
+                let e = std::io::Error::other(e);
+                if let Some(r) = rec.as_mut() {
+                    r.finish(&e.to_string());
+                }
+                Some((Err(e), None))
+            }
+            Ok(None) => {
+                if let Some(r) = rec.as_mut() {
+                    r.finish("");
+                }
+                None
+            }
+            Err(_) => {
+                let e = std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream went quiet");
+                if let Some(r) = rec.as_mut() {
+                    r.finish(&e.to_string());
+                }
+                Some((Err(e), None))
+            }
         }
     });
     builder.body(Body::from_stream(stream)).unwrap_or_else(|e| {
@@ -1164,5 +1290,249 @@ mod tests {
         assert!(listed.iter().all(|(id, _)| id != "fiona"));
         let (status, err) = post(&st, "x", ask("fiona")).await;
         assert_ne!(status, StatusCode::OK, "{err}");
+    }
+
+    // --- GET /status ---
+
+    type Feed = tokio::sync::mpsc::UnboundedSender<Result<Bytes, std::io::Error>>;
+
+    /// A fake upstream whose chat answer streams whatever is sent on the returned feed, until it is dropped.
+    async fn streaming_upstream() -> (String, Feed) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+        let rx = Arc::new(std::sync::Mutex::new(Some(rx)));
+        let app = axum::Router::new()
+            .route("/v1/models", axum::routing::get(|| async { "{}" }))
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let rx = rx.clone();
+                    async move {
+                        let rx = rx.lock().unwrap().take().expect("one request");
+                        Body::from_stream(tokio_stream_of(rx))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, tx)
+    }
+
+    fn tokio_stream_of(
+        rx: tokio::sync::mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>,
+    ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
+        futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|c| (c, rx)) })
+    }
+
+    /// maitred itself on a local port, in front of `upstream`; returns its origin.
+    async fn serve_status_state(upstream: String) -> (Arc<AppState>, String) {
+        let config: Config = serde_json::from_value(json!({
+            "listen": "127.0.0.1:0",
+            "upstreams": {
+                "hosted": {"base_url": "http://127.0.0.1:1/v1", "api_key_env": "NO_SUCH_VAR_FOR_TEST"},
+                "u": {"base_url": upstream, "slots": 4}
+            },
+            "models": [
+                {"id": "u/m", "upstream": "u", "upstream_model": "m", "display_name": "The M", "tier": 2},
+                {"id": "hosted/h", "upstream": "hosted", "upstream_model": "h", "hidden": true}
+            ],
+            "modes": [
+                {"name": "m", "label": "The M", "host": "box", "upstreams": ["u"]},
+                {"name": "dead", "label": "Dead", "host": "box", "upstreams": ["u", "hosted"]}
+            ],
+            "keys": [
+                {"name": "app", "env": "UNUSED"},
+                {"name": "idle", "env": "UNUSED"}
+            ]
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        let keys = config.keys.clone();
+        let mut st = AppState::new(config).unwrap();
+        st.keys = Keys::new(vec![("sk-app".to_string(), keys[0].clone())]);
+        let st = Arc::new(st);
+        let app = axum::Router::new()
+            .route("/status", axum::routing::get(status_page))
+            .route("/v1/{*rest}", axum::routing::post(v1))
+            .with_state(st.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (st, origin)
+    }
+
+    async fn status_json(origin: &str) -> Value {
+        let body = reqwest::get(format!("{origin}/status"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn chat(origin: &str, secret: &str, model: &str) -> reqwest::RequestBuilder {
+        reqwest::Client::new()
+            .post(format!("{origin}/v1/chat/completions"))
+            .bearer_auth(secret)
+            .header("content-type", "application/json")
+            .body(json!({"model": model, "stream": true, "messages": []}).to_string())
+    }
+
+    async fn next_chunk(resp: &mut reqwest::Response) -> String {
+        String::from_utf8_lossy(&resp.chunk().await.unwrap().unwrap()).into_owned()
+    }
+
+    /// Poll `/status` until its newest request satisfies `ok`.
+    async fn wait_for(origin: &str, ok: impl Fn(&Value) -> bool) -> Value {
+        for _ in 0..100 {
+            let s = status_json(origin).await;
+            if ok(&s["recent"][0]) {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("status never showed it: {}", status_json(origin).await);
+    }
+
+    #[tokio::test]
+    async fn a_streaming_request_shows_live_then_settles() {
+        let (base, feed) = streaming_upstream().await;
+        let (_st, origin) = serve_status_state(base).await;
+        let mut resp = chat(&origin, "sk-app", "u/m").send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        feed.send(Ok(Bytes::from_static(b"data: {\"choices\":[]}\n\n")))
+            .unwrap();
+        assert!(next_chunk(&mut resp).await.contains("choices"));
+
+        let s = status_json(&origin).await;
+        let r = &s["recent"][0];
+        assert_eq!(r["done"], false, "{s}");
+        assert_eq!(r["key"], "app");
+        assert_eq!(r["requested"], "u/m");
+        assert_eq!(r["model"], "u/m");
+        assert_eq!(r["upstream"], "u");
+        assert_eq!(r["route"], "");
+        assert_eq!(r["path"], "chat/completions");
+        assert_eq!(r["status"], 200);
+        assert!(r["headers_ms"].is_u64());
+        assert!(r["first_chunk_ms"].is_u64());
+        assert!(r["duration_ms"].is_null());
+        assert!(r["usage"].is_null());
+        assert_eq!(s["upstreams"][1]["in_flight"], 1);
+        assert_eq!(s["keys"][0]["in_flight"], 1);
+        assert_eq!(s["keys"][0]["requests"], 1);
+
+        feed.send(Ok(Bytes::from_static(
+            b"data: {\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":8,\
+              \"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\ndata: [DONE]\n\n",
+        )))
+        .unwrap();
+        drop(feed);
+        while resp.chunk().await.unwrap().is_some() {}
+
+        let s = wait_for(&origin, |r| r["done"] == true).await;
+        let r = &s["recent"][0];
+        assert_eq!(r["error"], "");
+        assert!(r["duration_ms"].is_u64());
+        assert_eq!(
+            r["usage"],
+            json!({"prompt_tokens": 50, "completion_tokens": 8, "cached_tokens": 32})
+        );
+        let k = &s["keys"][0];
+        assert_eq!(k["name"], "app");
+        assert_eq!(k["in_flight"], 0);
+        assert_eq!(k["failures"], 0);
+        assert_eq!(k["prompt_tokens"], 50);
+        assert_eq!(k["completion_tokens"], 8);
+        assert_eq!(k["cached_tokens"], 32);
+        assert!(k["last"].is_f64());
+        assert_eq!(s["upstreams"][1]["in_flight"], 0);
+        assert!(s["keys"][1]["last"].is_null(), "an unused key has no last");
+    }
+
+    #[tokio::test]
+    async fn own_errors_are_recorded_and_unauthenticated_requests_are_not() {
+        let (base, _feed) = streaming_upstream().await;
+        let (_st, origin) = serve_status_state(base).await;
+        let resp = chat(&origin, "sk-wrong", "u/m").send().await.unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = chat(&origin, "sk-app", "no/such").send().await.unwrap();
+        assert_eq!(resp.status(), 404);
+
+        let s = status_json(&origin).await;
+        assert_eq!(s["recent"].as_array().unwrap().len(), 1, "{s}");
+        let r = &s["recent"][0];
+        assert_eq!(r["error"], "model_not_found");
+        assert_eq!(r["status"], 404);
+        assert_eq!(r["done"], true);
+        assert_eq!(r["model"], "no/such");
+        assert_eq!(r["upstream"], "");
+        assert!(r["headers_ms"].is_null());
+        assert_eq!(s["keys"][0]["failures"], 1);
+        assert_eq!(s["keys"][0]["in_flight"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_drops_the_body_early_is_recorded() {
+        let (base, feed) = streaming_upstream().await;
+        let (_st, origin) = serve_status_state(base).await;
+        let mut resp = chat(&origin, "sk-app", "u/m").send().await.unwrap();
+        feed.send(Ok(Bytes::from_static(b"data: one\n\n"))).unwrap();
+        next_chunk(&mut resp).await;
+        drop(resp);
+        let s = wait_for(&origin, |r| r["done"] == true).await;
+        assert_eq!(s["recent"][0]["error"], "client closed");
+        assert_eq!(s["keys"][0]["failures"], 1);
+        assert_eq!(s["keys"][0]["in_flight"], 0);
+        assert_eq!(s["upstreams"][1]["in_flight"], 0);
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_breaks_the_stream_records_its_error() {
+        let (base, feed) = streaming_upstream().await;
+        let (_st, origin) = serve_status_state(base).await;
+        let mut resp = chat(&origin, "sk-app", "u/m").send().await.unwrap();
+        feed.send(Ok(Bytes::from_static(b"data: one\n\n"))).unwrap();
+        feed.send(Err(std::io::Error::other("boom"))).unwrap();
+        while let Ok(Some(_)) = resp.chunk().await {}
+        let s = wait_for(&origin, |r| r["done"] == true).await;
+        assert_ne!(s["recent"][0]["error"], "");
+        assert_ne!(s["recent"][0]["error"], "client closed");
+    }
+
+    #[tokio::test]
+    async fn status_describes_upstreams_modes_and_keys() {
+        let (base, _feed) = streaming_upstream().await;
+        let (_st, origin) = serve_status_state(base.clone()).await;
+        let s = status_json(&origin).await;
+        assert_eq!(s["version"], 1);
+        assert!(s["now"].as_f64().unwrap() >= s["started"].as_f64().unwrap());
+        let ups = s["upstreams"].as_array().unwrap();
+        assert_eq!(ups[0]["name"], "hosted", "config order");
+        assert_eq!(ups[0]["hosted"], true);
+        assert_eq!(ups[0]["serving"], false);
+        assert_ne!(ups[0]["reason"], "");
+        assert!(ups[0]["slots"].is_null());
+        assert_eq!(ups[0]["host"], "box");
+        assert_eq!(
+            ups[0]["models"],
+            json!([{"id": "hosted/h", "display_name": "hosted/h", "hidden": true, "tier": null}])
+        );
+        assert_eq!(ups[1]["name"], "u");
+        assert_eq!(ups[1]["base_url"], base);
+        assert_eq!(ups[1]["hosted"], false);
+        assert_eq!(ups[1]["serving"], true);
+        assert_eq!(ups[1]["reason"], "");
+        assert_eq!(ups[1]["slots"], 4);
+        assert_eq!(ups[1]["models"][0]["display_name"], "The M");
+        assert_eq!(ups[1]["models"][0]["tier"], 2);
+        let modes = s["modes"].as_array().unwrap();
+        assert_eq!(modes[0]["name"], "m");
+        assert_eq!(modes[0]["serving"], true);
+        assert_eq!(modes[1]["serving"], false, "one upstream of it is down");
+        assert_eq!(modes[1]["upstreams"], json!(["u", "hosted"]));
+        assert_eq!(s["keys"].as_array().unwrap().len(), 2);
+        assert_eq!(s["recent"], json!([]));
     }
 }
