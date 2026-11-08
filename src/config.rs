@@ -10,7 +10,7 @@ pub struct Config {
     /// `host:port` to listen on.
     pub listen: String,
     /// Inference servers, by name (the `provider` part of a model id).
-    pub upstreams: HashMap<String, Upstream>,
+    pub upstreams: Upstreams,
     /// Every model the gateway offers. Listed in `/v1/models` whether or not its server is up.
     pub models: Vec<Model>,
     /// Groups of upstreams that run together and exclude each other (son-of-anton's `llm-mode`).
@@ -58,6 +58,51 @@ pub struct McpServer {
 
 fn default_tool_timeout() -> u64 {
     300
+}
+
+/// The upstreams by name, remembering the order the file lists them in (`/status` reports them in it).
+#[derive(Debug, Clone, Default)]
+pub struct Upstreams {
+    by_name: HashMap<String, Upstream>,
+    order: Vec<String>,
+}
+
+impl Upstreams {
+    /// The names in config order.
+    pub fn names(&self) -> &[String] {
+        &self.order
+    }
+}
+
+impl std::ops::Deref for Upstreams {
+    type Target = HashMap<String, Upstream>;
+    fn deref(&self) -> &Self::Target {
+        &self.by_name
+    }
+}
+
+impl<'de> Deserialize<'de> for Upstreams {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Upstreams;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map of upstreams")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut m: A,
+            ) -> Result<Upstreams, A::Error> {
+                let mut out = Upstreams::default();
+                while let Some((k, v)) = m.next_entry::<String, Upstream>()? {
+                    out.order.push(k.clone());
+                    out.by_name.insert(k, v);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_map(V)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -326,7 +371,7 @@ impl Config {
                 }
             }
         }
-        for (name, u) in &self.upstreams {
+        for (name, u) in self.upstreams.iter() {
             if u.slots == Some(0) {
                 return Err(format!("upstream {name}: slots must be at least 1"));
             }
