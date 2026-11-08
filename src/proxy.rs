@@ -1510,6 +1510,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_that_closes_after_done_is_not_a_failure() {
+        let (base, feed) = streaming_upstream().await;
+        let (_st, origin) = serve_status_state(base).await;
+        let mut resp = chat(&origin, "sk-app", "u/m").send().await.unwrap();
+        feed.send(Ok(Bytes::from_static(
+            b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n",
+        )))
+        .unwrap();
+        assert!(next_chunk(&mut resp).await.contains("[DONE]"));
+        // The upstream has not ended the body; the client closes anyway.
+        drop(resp);
+        let s = wait_for(&origin, |r| r["done"] == true).await;
+        let r = &s["recent"][0];
+        assert_eq!(r["error"], "", "{s}");
+        assert_eq!(r["usage"]["completion_tokens"], 2);
+        assert_eq!(s["keys"][0]["failures"], 0);
+        assert_eq!(s["keys"][0]["in_flight"], 0);
+        drop(feed);
+    }
+
+    #[tokio::test]
     async fn an_upstream_that_breaks_the_stream_records_its_error() {
         let (base, feed) = streaming_upstream().await;
         let (_st, origin) = serve_status_state(base).await;

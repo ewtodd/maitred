@@ -356,7 +356,11 @@ impl Rec {
 
 impl Drop for Rec {
     fn drop(&mut self) {
-        self.finish(CLIENT_CLOSED);
+        // A client that stops reading once it has an SSE stream's `data: [DONE]` got the whole answer;
+        // many close there instead of reading to the end of the body.
+        const DONE: &[u8] = b"data: [DONE]";
+        let complete = self.tail.windows(DONE.len()).any(|w| w == DONE);
+        self.finish(if complete { "" } else { CLIENT_CLOSED });
     }
 }
 
