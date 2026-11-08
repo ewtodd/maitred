@@ -98,7 +98,8 @@ hosted API, three keys, an MCP server and a passthrough.
 `GET /health` answers `ok`.
 
 `GET /status` answers JSON for monitors (llmtop polls it each second): every upstream with its probe verdict
-(the cached one `/v1/models` uses), in-flight count, slots and models; the modes and whether each is fully
+(the cached one `/v1/models` uses; hosted upstreams are not probed, `serving: null`), in-flight count, slots and
+models; the modes and whether each is fully
 serving; per-key counters since start (requests, failures, in flight, prompt/completion/cached tokens); and
 `recent`, the last 512 requests newest first, updated live while they stream (model and upstream picked, status,
 time to headers and first chunk, duration, the error, and the `usage` read from the end of the answer). It needs

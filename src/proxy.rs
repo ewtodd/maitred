@@ -305,25 +305,36 @@ pub async fn model(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> R
     Json(model_entry(&st.config, m, &up)).into_response()
 }
 
-/// `GET /status`: what llmtop shows. Upstream verdicts come from the probe snapshot `/v1/models` uses; the
+/// `GET /status`: what llmtop shows. Upstream verdicts come from the cached probes `/v1/models` uses; the
 /// requests and key counters from the request log. Unauthenticated: the WAN proxy does not forward it.
+/// Hosted upstreams are not probed here (`serving: null`): llmtop polls this every second, which would
+/// otherwise keep a request to a hosted API going out every probe TTL around the clock.
 pub async fn status_page(State(st): State<Arc<AppState>>) -> Response {
-    let up = st.probes.snapshot(&st.config).await;
     let config = &st.config;
+    let up: HashMap<String, bool> = futures_util::future::join_all(
+        config
+            .upstreams
+            .iter()
+            .filter(|(_, u)| u.api_key_env.is_none())
+            .map(|(name, u)| async { (name.clone(), st.probes.is_up(&u.base_url).await) }),
+    )
+    .await
+    .into_iter()
+    .collect();
     let upstreams: Vec<Value> = config
         .upstreams
         .names()
         .iter()
         .map(|name| {
             let u = &config.upstreams[name];
-            let serving = up.get(name).copied().unwrap_or(false);
+            let serving = up.get(name).copied();
             json!({
                 "name": name,
                 "base_url": u.base_url,
                 "host": config.modes.iter().find(|m| m.upstreams.contains(name)).map(|m| &m.host),
                 "hosted": u.api_key_env.is_some(),
                 "serving": serving,
-                "reason": if serving { String::new() } else { format!("{}/models did not answer", u.base_url.trim_end_matches('/')) },
+                "reason": if serving == Some(false) { format!("{}/models did not answer", u.base_url.trim_end_matches('/')) } else { String::new() },
                 "in_flight": st.activity.in_flight(name),
                 "slots": u.slots,
                 "models": config.models.iter().filter(|m| &m.upstream == name).map(|m| json!({
@@ -1511,8 +1522,11 @@ mod tests {
         let ups = s["upstreams"].as_array().unwrap();
         assert_eq!(ups[0]["name"], "hosted", "config order");
         assert_eq!(ups[0]["hosted"], true);
-        assert_eq!(ups[0]["serving"], false);
-        assert_ne!(ups[0]["reason"], "");
+        assert!(
+            ups[0]["serving"].is_null(),
+            "hosted upstreams are not probed"
+        );
+        assert_eq!(ups[0]["reason"], "");
         assert!(ups[0]["slots"].is_null());
         assert_eq!(ups[0]["host"], "box");
         assert_eq!(
@@ -1530,7 +1544,10 @@ mod tests {
         let modes = s["modes"].as_array().unwrap();
         assert_eq!(modes[0]["name"], "m");
         assert_eq!(modes[0]["serving"], true);
-        assert_eq!(modes[1]["serving"], false, "one upstream of it is down");
+        assert_eq!(
+            modes[1]["serving"], false,
+            "an unprobed upstream does not count as serving"
+        );
         assert_eq!(modes[1]["upstreams"], json!(["u", "hosted"]));
         assert_eq!(s["keys"].as_array().unwrap().len(), 2);
         assert_eq!(s["recent"], json!([]));
