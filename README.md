@@ -102,7 +102,7 @@ hosted API, three keys, an MCP server and a passthrough.
 models; the modes and whether each is fully
 serving; per-key counters since start (requests, failures, in flight, prompt/completion/cached tokens); and
 `recent`, the last 512 requests newest first, updated live while they stream (model and upstream picked, status,
-time to headers and first chunk, duration, the error, and the `usage` read from the end of the answer). It needs
+time to headers, first chunk and first generated token, duration, the error, and the `usage` read from the end of the answer). It needs
 no key and is meant for the LAN: put nothing but `/v1*` and `/mcp*` on a public reverse proxy. Requests without
 a valid key are not recorded.
 

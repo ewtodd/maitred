@@ -83,6 +83,7 @@ struct Entry {
     status: u16,
     headers_ms: Option<u64>,
     first_chunk_ms: Option<u64>,
+    first_token_ms: Option<u64>,
     duration_ms: Option<u64>,
     done: bool,
     error: String,
@@ -103,6 +104,7 @@ impl Entry {
             "status": self.status,
             "headers_ms": self.headers_ms,
             "first_chunk_ms": self.first_chunk_ms,
+            "first_token_ms": self.first_token_ms,
             "duration_ms": self.duration_ms,
             "done": self.done,
             "error": self.error,
@@ -186,6 +188,7 @@ impl RequestLog {
             status: 0,
             headers_ms: None,
             first_chunk_ms: None,
+            first_token_ms: None,
             duration_ms: None,
             done: false,
             error: String::new(),
@@ -204,6 +207,7 @@ impl RequestLog {
             status: AtomicU16::new(0),
             finished: false,
             first_chunk: false,
+            first_token: false,
             tail: Vec::new(),
         }
     }
@@ -246,6 +250,7 @@ pub struct Rec {
     status: AtomicU16,
     finished: bool,
     first_chunk: bool,
+    first_token: bool,
     tail: Vec<u8>,
 }
 
@@ -289,6 +294,11 @@ impl Rec {
             self.first_chunk = true;
             let ms = millis(self.arrived);
             self.update(|e| e.first_chunk_ms = Some(ms));
+        }
+        if !self.first_token && carries_token(chunk) {
+            self.first_token = true;
+            let ms = millis(self.arrived);
+            self.update(|e| e.first_token_ms = Some(ms));
         }
         // Keep the end of the body: trim in batches, not on every chunk.
         if chunk.len() >= TAIL {
@@ -348,6 +358,34 @@ impl Drop for Rec {
     fn drop(&mut self) {
         self.finish(CLIENT_CLOSED);
     }
+}
+
+/// Whether a relayed chunk carries generated output: a non-empty `content`, `reasoning_content`, `reasoning`,
+/// `text` or Responses `delta` string, or a non-empty `tool_calls` array. Servers send an empty role chunk as
+/// soon as they accept a stream, so the first chunk says nothing about the time to the first token. A pattern
+/// split across two chunks is seen one chunk late.
+fn carries_token(chunk: &[u8]) -> bool {
+    const STRINGS: [&[u8]; 5] = [
+        b"\"content\":",
+        b"\"reasoning_content\":",
+        b"\"reasoning\":",
+        b"\"text\":",
+        b"\"delta\":",
+    ];
+    let after = |needle: &[u8], at: usize| -> &[u8] {
+        let rest = &chunk[at + needle.len()..];
+        let skip = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        &rest[skip..]
+    };
+    let found = |needle: &[u8], open: u8, close: u8| {
+        chunk.windows(needle.len()).enumerate().any(|(i, w)| {
+            w == needle && {
+                let v = after(needle, i);
+                v.len() >= 2 && v[0] == open && v[1] != close
+            }
+        })
+    };
+    STRINGS.iter().any(|k| found(k, b'"', b'"')) || found(b"\"tool_calls\":", b'[', b']')
 }
 
 #[cfg(test)]
@@ -453,5 +491,33 @@ mod tests {
         let (_, keys) = log.snapshot(&["k"]);
         assert_eq!(keys[0]["in_flight"], 0);
         assert_eq!(keys[0]["failures"], 1);
+    }
+
+    #[test]
+    fn carries_token_only_for_generated_output() {
+        let yes: [&[u8]; 8] = [
+            br#"data: {"choices":[{"delta":{"content":"Hi"}}]}"#,
+            br#"data: {"choices":[{"delta":{"reasoning_content":"Let"}}]}"#,
+            br#"data: {"choices":[{"delta":{"reasoning":"Let"}}]}"#,
+            br#"data: {"choices":[{"delta": {"content": "x"}}]}"#,
+            br#"data: {"choices":[{"delta":{"content":"\"q"}}]}"#,
+            br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}"#,
+            br#"data: {"choices":[{"text":"a","index":0}]}"#,
+            br#"data: {"type":"response.output_text.delta","delta":"Hi"}"#,
+        ];
+        for c in yes {
+            assert!(carries_token(c), "{}", String::from_utf8_lossy(c));
+        }
+        let no: [&[u8]; 6] = [
+            br#"data: {"choices":[{"delta":{"role":"assistant","content":""}}]}"#,
+            br#"data: {"choices":[{"delta":{"content":null}}]}"#,
+            br#"data: {"choices":[{"delta":{"tool_calls":[]}}]}"#,
+            br#"data: {"choices":[],"usage":{"prompt_tokens":3}}"#,
+            b"data: [DONE]",
+            br#"data: {"choices":[{"delta":{"content":"#,
+        ];
+        for c in no {
+            assert!(!carries_token(c), "{}", String::from_utf8_lossy(c));
+        }
     }
 }

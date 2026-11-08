@@ -1428,11 +1428,21 @@ mod tests {
         assert_eq!(r["status"], 200);
         assert!(r["headers_ms"].is_u64());
         assert!(r["first_chunk_ms"].is_u64());
+        assert!(r["first_token_ms"].is_null(), "no output yet");
         assert!(r["duration_ms"].is_null());
         assert!(r["usage"].is_null());
         assert_eq!(s["upstreams"][1]["in_flight"], 1);
         assert_eq!(s["keys"][0]["in_flight"], 1);
         assert_eq!(s["keys"][0]["requests"], 1);
+
+        feed.send(Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        )))
+        .unwrap();
+        assert!(next_chunk(&mut resp).await.contains("Hi"));
+        let s = wait_for(&origin, |r| r["first_token_ms"].is_u64()).await;
+        let r = &s["recent"][0];
+        assert!(r["first_token_ms"].as_u64() >= r["first_chunk_ms"].as_u64());
 
         feed.send(Ok(Bytes::from_static(
             b"data: {\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":8,\
