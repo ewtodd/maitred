@@ -17,9 +17,14 @@ pub struct Probes {
 
 impl Probes {
     pub fn new(keys: HashMap<String, String>) -> Probes {
+        // A fresh connection for every probe. cpp-httplib servers (unholy, eklow, llama.cpp) close a
+        // keep-alive connection after 5 s idle, and a probe comes due just after PROBE_TTL, also 5 s:
+        // a pooled connection was being reused as the server closed it, and the upstream read as down
+        // for the next 5 s while it answered in a millisecond.
         let client = reqwest::Client::builder()
             .connect_timeout(PROBE_TIMEOUT)
             .timeout(PROBE_TIMEOUT)
+            .pool_max_idle_per_host(0)
             .build()
             .expect("probe client");
         Probes {
@@ -168,6 +173,50 @@ fn or_list(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that answers only the first request on each connection and then closes it, as a
+    /// keep-alive connection behaves when the server times it out as it is reused.
+    async fn one_request_per_connection() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let mut got = Vec::new();
+                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        got.extend_from_slice(&buf[..n]);
+                    }
+                    let body = b"{\"data\":[]}";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    // The next request on this connection gets no answer.
+                    let _ = sock.read(&mut buf).await;
+                });
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn probes_never_reuse_a_connection() {
+        let base = one_request_per_connection().await;
+        let probes = Probes::new(HashMap::new());
+        for i in 0..3 {
+            probes.invalidate(&base);
+            assert!(probes.is_up(&base).await, "probe {i} on a stale connection");
+        }
+    }
 
     fn config() -> Config {
         serde_json::from_value(serde_json::json!({

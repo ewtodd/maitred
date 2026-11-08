@@ -37,9 +37,12 @@ impl AppState {
         let mut clients = HashMap::new();
         let mut upstream_keys = HashMap::new();
         for (name, u) in config.upstreams.iter() {
+            // Idle connections go before cpp-httplib's 5 s keep-alive timeout closes them under a
+            // request (see Probes::new).
             let client = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(u.connect_timeout_secs))
                 .timeout(Duration::from_secs(u.timeout_secs))
+                .pool_idle_timeout(Duration::from_secs(4))
                 .build()
                 .map_err(|e| format!("upstream {name}: {e}"))?;
             clients.insert(name.clone(), client);
